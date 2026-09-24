@@ -1,0 +1,2 @@
+-- No-op migration.
+-- "DailyMaterialUpdate" is already created in the consolidated init migration.
