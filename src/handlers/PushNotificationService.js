@@ -485,20 +485,29 @@ class PushNotificationService {
       if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth || !resolvedUserId) {
         return this.response.sendResponse(req, res, { message: "Invalid subscription details", status: 400 });
       }
-      await prisma.pushSubscription.upsert({
-        where: { endpoint: subscription.endpoint },
-        create: {
-          userId: resolvedUserId,
-          endpoint: subscription.endpoint,
-          p256dh: subscription.keys.p256dh,
-          auth: subscription.keys.auth,
-        },
-        update: {
-          userId: resolvedUserId,
-          p256dh: subscription.keys.p256dh,
-          auth: subscription.keys.auth,
-        },
-      });
+      // One active subscription per user: drop stale endpoints, then upsert current.
+      await prisma.$transaction([
+        prisma.pushSubscription.deleteMany({
+          where: {
+            userId: resolvedUserId,
+            NOT: { endpoint: subscription.endpoint },
+          },
+        }),
+        prisma.pushSubscription.upsert({
+          where: { endpoint: subscription.endpoint },
+          create: {
+            userId: resolvedUserId,
+            endpoint: subscription.endpoint,
+            p256dh: subscription.keys.p256dh,
+            auth: subscription.keys.auth,
+          },
+          update: {
+            userId: resolvedUserId,
+            p256dh: subscription.keys.p256dh,
+            auth: subscription.keys.auth,
+          },
+        }),
+      ]);
       return this.response.sendResponse(req, res, { message: "Subscription saved successfully", status: 200 });
     } catch (error) {
       return this.response.sendResponse(req, res, { message: "Error saving subscription", status: 500, data: error.message });
