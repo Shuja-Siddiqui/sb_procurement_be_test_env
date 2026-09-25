@@ -27,15 +27,47 @@ class PushNotificationService {
     String(process.env.FRONTEND_APP_URL || "https://sb-procurement-fe-v2.vercel.app").replace(/\/+$/, "");
 
   sendPushToUsers = async (userIds = [], payload = {}) => {
-    if (!this.vapidConfigured || !Array.isArray(userIds) || userIds.length === 0) {
-      return;
+    const targetUserIds = [...new Set((userIds || []).map((id) => Number(id)))]
+      .filter((id) => Number.isFinite(id) && id > 0);
+
+    const summary = {
+      targeted: targetUserIds,
+      received: [],
+      failed: [],
+      noSubscription: [],
+      staleRemoved: [],
+    };
+
+    if (!this.vapidConfigured) {
+      console.warn("[Notification][Push] skipped — VAPID not configured", {
+        title: payload?.title,
+        targeted: targetUserIds,
+      });
+      summary.noSubscription = targetUserIds;
+      return summary;
     }
+
+    if (targetUserIds.length === 0) {
+      console.log("[Notification][Push] skipped — no target users", {
+        title: payload?.title,
+      });
+      return summary;
+    }
+
     const subscriptions = await prisma.pushSubscription.findMany({
-      where: { userId: { in: userIds } },
+      where: { userId: { in: targetUserIds } },
       select: { endpoint: true, p256dh: true, auth: true, userId: true },
     });
+
+    const usersWithSubscription = new Set(subscriptions.map((sub) => Number(sub.userId)));
+    summary.noSubscription = targetUserIds.filter((id) => !usersWithSubscription.has(id));
+
+    const receivedSet = new Set();
+    const failedSet = new Set();
+
     await Promise.all(
       subscriptions.map(async (sub) => {
+        const userId = Number(sub.userId);
         try {
           await webpush.sendNotification(
             {
@@ -47,11 +79,15 @@ class PushNotificationService {
               appUrl: payload?.appUrl || this.getFrontendAppUrl(),
             })
           );
-          // success
+          receivedSet.add(userId);
+          console.log(
+            `[Notification][Push] RECEIVED user=${userId} endpoint=${sub.endpoint.slice(0, 60)}...`
+          );
         } catch (error) {
           const statusCode = error?.statusCode;
+          failedSet.add(userId);
           console.error(
-            `[Notification][Push] failed user=${sub.userId} endpoint=${sub.endpoint.slice(
+            `[Notification][Push] NOT RECEIVED user=${userId} endpoint=${sub.endpoint.slice(
               0,
               60
             )}... status=${statusCode || "unknown"} message=${error?.message || "Unknown error"}`
@@ -60,14 +96,41 @@ class PushNotificationService {
           // Clean these up so users can resubscribe with a fresh endpoint.
           if (statusCode === 403 || statusCode === 404 || statusCode === 410) {
             await prisma.pushSubscription.deleteMany({ where: { endpoint: sub.endpoint } });
-            // stale subscription removed
+            summary.staleRemoved.push(userId);
+            console.warn(
+              `[Notification][Push] stale endpoint removed user=${userId} status=${statusCode}`
+            );
           }
         }
       })
     );
+
+    // A user "received" if at least one device push succeeded.
+    summary.received = [...receivedSet];
+    summary.failed = [...failedSet].filter((id) => !receivedSet.has(id));
+
+    console.log("[Notification][Push] summary", {
+      title: payload?.title,
+      type: payload?.type,
+      targeted: summary.targeted,
+      received: summary.received,
+      failed: summary.failed,
+      noSubscription: summary.noSubscription,
+      staleRemoved: [...new Set(summary.staleRemoved)],
+    });
+
+    return summary;
   };
 
-  logNotificationFlow = ({ event, senderId, recipientIds = [] }) => {};
+  logNotificationFlow = ({ event, senderId, recipientIds = [] }) => {
+    console.log("[Notification][Flow]", {
+      event,
+      senderId: Number(senderId) || null,
+      recipientIds: [...new Set((recipientIds || []).map((id) => Number(id)))]
+        .filter((id) => Number.isFinite(id) && id > 0),
+      totalRecipients: Array.isArray(recipientIds) ? recipientIds.length : 0,
+    });
+  };
 
   resolveActionFromRequestPayload = (
     payload = {},
@@ -274,7 +337,10 @@ class PushNotificationService {
       });
 
     this.logNotificationFlow({ event, senderId, recipientIds: uniqueRecipientIds });
-    if (uniqueRecipientIds.length === 0) return { totalRecipients: 0, createdCount: 0 };
+    if (uniqueRecipientIds.length === 0) {
+      console.log("[Notification][Dispatch] skipped — no recipients", { event, senderId, title });
+      return { totalRecipients: 0, createdCount: 0 };
+    }
 
     const rows = this.createNotificationPayloadForUsers({
       recipientIds: uniqueRecipientIds,
@@ -297,6 +363,8 @@ class PushNotificationService {
     });
     const existingUsers = new Set(existing.map((row) => Number(row.userId)));
     const filteredRows = rows.filter((row) => !existingUsers.has(row.userId));
+    const dbSavedUserIds = filteredRows.map((row) => Number(row.userId));
+    const dbSkippedUserIds = uniqueRecipientIds.filter((id) => existingUsers.has(id));
 
     if (filteredRows.length > 0) {
       await prisma.notification.createMany({
@@ -304,7 +372,14 @@ class PushNotificationService {
       });
     }
 
-    await this.sendPushToUsers(uniqueRecipientIds, {
+    console.log("[Notification][DB]", {
+      event,
+      title,
+      savedUserIds: dbSavedUserIds,
+      skippedDuplicateUserIds: dbSkippedUserIds,
+    });
+
+    const pushSummary = await this.sendPushToUsers(uniqueRecipientIds, {
       title,
       body,
       type,
@@ -343,10 +418,23 @@ class PushNotificationService {
       senderId,
     });
 
+    console.log("[Notification][Dispatch] final", {
+      event,
+      senderId,
+      title,
+      targeted: uniqueRecipientIds,
+      dbSaved: dbSavedUserIds,
+      dbSkippedDuplicate: dbSkippedUserIds,
+      pushReceived: pushSummary?.received || [],
+      pushFailed: pushSummary?.failed || [],
+      pushNoSubscription: pushSummary?.noSubscription || [],
+    });
+
     return {
       totalRecipients: uniqueRecipientIds.length,
       createdCount: filteredRows.length,
       duplicateSkipped: uniqueRecipientIds.length - filteredRows.length,
+      pushSummary,
     };
   };
 
@@ -431,7 +519,7 @@ class PushNotificationService {
           data: { groupId: group.id },
         })),
       });
-      await this.sendPushToUsers(
+      const pushSummary = await this.sendPushToUsers(
         recipients.map((m) => m.userId),
         {
           title: `${message?.sender?.name || "User"} - ${group.name}`,
@@ -440,7 +528,13 @@ class PushNotificationService {
           data: { groupId: group.id },
         }
       );
-      return res.status(200).json({ message: "Notification sent", totalRecipients: recipients.length, failed: 0 });
+      return res.status(200).json({
+        message: "Notification sent",
+        totalRecipients: recipients.length,
+        pushReceived: pushSummary?.received || [],
+        pushFailed: pushSummary?.failed || [],
+        pushNoSubscription: pushSummary?.noSubscription || [],
+      });
     } catch (error) {
       return res.status(500).json({ message: "Error sending notification", data: error.message });
     }
