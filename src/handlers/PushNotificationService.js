@@ -56,7 +56,14 @@ class PushNotificationService {
 
     const subscriptions = await prisma.pushSubscription.findMany({
       where: { userId: { in: targetUserIds } },
-      select: { endpoint: true, p256dh: true, auth: true, userId: true },
+      select: {
+        endpoint: true,
+        p256dh: true,
+        auth: true,
+        userId: true,
+        deviceType: true,
+        userAgent: true,
+      },
     });
 
     const usersWithSubscription = new Set(subscriptions.map((sub) => Number(sub.userId)));
@@ -64,10 +71,12 @@ class PushNotificationService {
 
     const receivedSet = new Set();
     const failedSet = new Set();
+    const byDevice = [];
 
     await Promise.all(
       subscriptions.map(async (sub) => {
         const userId = Number(sub.userId);
+        const device = sub.deviceType || "unknown";
         try {
           await webpush.sendNotification(
             {
@@ -85,14 +94,22 @@ class PushNotificationService {
             }
           );
           receivedSet.add(userId);
+          byDevice.push({ userId, device, status: "RECEIVED", endpoint: sub.endpoint.slice(0, 60) });
           console.log(
-            `[Notification][Push] RECEIVED user=${userId} endpoint=${sub.endpoint.slice(0, 60)}...`
+            `[Notification][Push] RECEIVED user=${userId} device=${device} endpoint=${sub.endpoint.slice(0, 60)}...`
           );
         } catch (error) {
           const statusCode = error?.statusCode;
           failedSet.add(userId);
+          byDevice.push({
+            userId,
+            device,
+            status: "NOT_RECEIVED",
+            statusCode: statusCode || "unknown",
+            endpoint: sub.endpoint.slice(0, 60),
+          });
           console.error(
-            `[Notification][Push] NOT RECEIVED user=${userId} endpoint=${sub.endpoint.slice(
+            `[Notification][Push] NOT RECEIVED user=${userId} device=${device} endpoint=${sub.endpoint.slice(
               0,
               60
             )}... status=${statusCode || "unknown"} message=${error?.message || "Unknown error"}`
@@ -103,7 +120,7 @@ class PushNotificationService {
             await prisma.pushSubscription.deleteMany({ where: { endpoint: sub.endpoint } });
             summary.staleRemoved.push(userId);
             console.warn(
-              `[Notification][Push] stale endpoint removed user=${userId} status=${statusCode}`
+              `[Notification][Push] stale endpoint removed user=${userId} device=${device} status=${statusCode}`
             );
           }
         }
@@ -113,6 +130,7 @@ class PushNotificationService {
     // A user "received" if at least one device push succeeded.
     summary.received = [...receivedSet];
     summary.failed = [...failedSet].filter((id) => !receivedSet.has(id));
+    summary.byDevice = byDevice;
 
     console.log("[Notification][Push] summary", {
       title: payload?.title,
@@ -122,6 +140,9 @@ class PushNotificationService {
       failed: summary.failed,
       noSubscription: summary.noSubscription,
       staleRemoved: [...new Set(summary.staleRemoved)],
+      byDevice,
+      mobile: byDevice.filter((d) => d.device === "mobile"),
+      desktop: byDevice.filter((d) => d.device === "desktop"),
     });
 
     return summary;
@@ -579,11 +600,17 @@ class PushNotificationService {
 
   saveSubscription = async (req, res) => {
     try {
-      const { subscription, userId } = req.body;
+      const { subscription, userId, deviceType, userAgent } = req.body;
       const resolvedUserId = Number(req.user?.id || userId);
       if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth || !resolvedUserId) {
         return this.response.sendResponse(req, res, { message: "Invalid subscription details", status: 400 });
       }
+      const resolvedDevice =
+        ["mobile", "tablet", "desktop"].includes(String(deviceType || "").toLowerCase())
+          ? String(deviceType).toLowerCase()
+          : "unknown";
+      const resolvedUa = String(userAgent || req.headers["user-agent"] || "").slice(0, 300);
+
       // Upsert by endpoint: same device updates one row; new device (new endpoint) inserts another row.
       await prisma.pushSubscription.upsert({
         where: { endpoint: subscription.endpoint },
@@ -592,12 +619,21 @@ class PushNotificationService {
           endpoint: subscription.endpoint,
           p256dh: subscription.keys.p256dh,
           auth: subscription.keys.auth,
+          deviceType: resolvedDevice,
+          userAgent: resolvedUa,
         },
         update: {
           userId: resolvedUserId,
           p256dh: subscription.keys.p256dh,
           auth: subscription.keys.auth,
+          deviceType: resolvedDevice,
+          userAgent: resolvedUa,
         },
+      });
+      console.log("[Notification][Subscription] saved", {
+        userId: resolvedUserId,
+        device: resolvedDevice,
+        endpoint: subscription.endpoint.slice(0, 60),
       });
       return this.response.sendResponse(req, res, { message: "Subscription saved successfully", status: 200 });
     } catch (error) {
