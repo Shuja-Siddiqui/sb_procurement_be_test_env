@@ -77,7 +77,12 @@ class PushNotificationService {
             JSON.stringify({
               ...payload,
               appUrl: payload?.appUrl || this.getFrontendAppUrl(),
-            })
+            }),
+            {
+              // high = ask FCM/Android to deliver sooner (reduces 5–10 min Doze delays)
+              urgency: "high",
+              TTL: 60 * 60, // keep message up to 1 hour if device is offline
+            }
           );
           receivedSet.add(userId);
           console.log(
