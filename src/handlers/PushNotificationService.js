@@ -77,6 +77,11 @@ class PushNotificationService {
       subscriptions.map(async (sub) => {
         const userId = Number(sub.userId);
         const device = sub.deviceType || "unknown";
+        const pushStartTime = Date.now();
+
+        console.log(
+          `[Notification][Push] SENDING user=${userId} device=${device} time=${new Date().toISOString()}`
+        );
         try {
           await webpush.sendNotification(
             {
