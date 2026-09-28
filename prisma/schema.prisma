@@ -9,130 +9,86 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
-enum Role {
-  SUPER_ADMIN
-  ADMIN
-  QA
-  ACCOUNT
-  DIRECTOR
-  SUPERVISOR
-  PURCHASER
-  SR_ENGINEER
-}
-
-enum RequestStatus {
-  PENDING
-  IN_PROGRESS
-  APPROVED
-  REJECTED
-  CONFLICT
-  COMPLETED
-}
-
-enum StageName {
-  QA
-  ACCOUNT
-  PURCHASER
-  SUPERVISOR
-  RECEIVING
-}
-
-enum MessageType {
-  TEXT
-  MEDIA
-  AUDIO
-  FILE
-}
-
-enum TaskStatus {
-  TODO
-  IN_PROGRESS
-  DELAY
-  COMPLETE
-  DISCARDED
-}
-
 model User {
-  id                Int                @id @default(autoincrement())
-  name              String
-  email             String             @unique
-  password          String
-  cnic              String
-  gender            String
-  number            String
-  role              Role
-  purchaserAllProducts Boolean         @default(false)
-  status            String
-  alreadyAssigned   Boolean            @default(false)
-  createdAt         DateTime           @default(now())
-  updatedAt         DateTime           @updatedAt
-  isEdit            Boolean            @default(false)
-  updatedSites      Site[]             @relation("UpdatedByUser")
-  createdGroups     ChatGroup[]        @relation("UserCreatedGroups")
-  chatMemberships   ChatMember[]
-  messages          Message[]
-  ChatGroup         ChatGroup[]
-  userNotifications Notification[]
-  requestStages     RequestStage[]
-  siteSupervisors   SiteSupervisor[]
-  sitePurchasers    SitePurchaser[]
-  siteSeniorEngineers SiteSeniorEngineer[]
-  purchaserProducts  UserProduct[]
-  subscriptions     PushSubscription[]
-  createdTasks      Task[]             @relation("TaskCreatedBy")
-  updatedTasks      Task[]             @relation("TaskUpdatedBy")
-  taskLogs          TaskLog[]          @relation("TaskLogActor")
+  id                   Int                  @id @default(autoincrement())
+  name                 String
+  email                String               @unique
+  password             String
+  cnic                 String
+  gender               String
+  number               String
+  role                 Role
+  purchaserAllProducts Boolean              @default(false)
+  status               String
+  alreadyAssigned      Boolean              @default(false)
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+  isEdit               Boolean              @default(false)
+  createdGroups        ChatGroup[]          @relation("UserCreatedGroups")
+  ChatGroup            ChatGroup[]
+  chatMemberships      ChatMember[]
+  messages             Message[]
+  userNotifications    Notification[]
+  subscriptions        PushSubscription[]
+  requestStages        RequestStage[]
+  updatedSites         Site[]               @relation("UpdatedByUser")
+  sitePurchasers       SitePurchaser[]
+  siteSeniorEngineers  SiteSeniorEngineer[]
+  siteSupervisors      SiteSupervisor[]
+  createdTasks         Task[]               @relation("TaskCreatedBy")
+  updatedTasks         Task[]               @relation("TaskUpdatedBy")
+  taskLogs             TaskLog[]            @relation("TaskLogActor")
+  purchaserProducts    UserProduct[]
 }
 
 model Site {
-  id             Int              @id @default(autoincrement())
-  name           String
-  address        String
-  client_name    String
-  city           String
-  province       String
-  plot_size      String
-  status         String
-  created_at     DateTime         @default(now())
-  updated_at     DateTime         @updatedAt
-  updated_by     Int?
-  updatedByUser  User?            @relation("UpdatedByUser", fields: [updated_by], references: [id])
-  currentStage   String           @default("")
-  locationUrl    String?
-  coveredArea    String?
+  id                   Int                       @id @default(autoincrement())
+  name                 String
+  address              String
+  client_name          String
+  city                 String
+  province             String
+  plot_size            String
+  status               String
+  created_at           DateTime                  @default(now())
+  updated_at           DateTime                  @updatedAt
+  updated_by           Int?
+  currentStage         String                    @default("")
+  locationUrl          String?
+  coveredArea          String?
   marketingPersonName  String?
   marketingPersonPhone String?
-  startDate      DateTime?
-  endDate        DateTime?
-  requests       Request[]
-  materialTotal  MaterialTotal?
-  stageMaterial  StageMaterial?
-  Product        Product?         @relation(fields: [productId], references: [id])
-  productId      Int?
-  extraMaterial  ExtraMaterial[]
-  supervisors    SiteSupervisor[]
-  purchasers     SitePurchaser[]
-  seniorEngineers SiteSeniorEngineer[]
-  contractorData ContractorData?
-  agreementData AgreementData[]
-  dailyUpdates   DailyMaterialUpdate[]
-  dailyIssues    DailyIssueUpdate[]
-  dailySiteProgress DailySiteProgressUpdate[]
+  startDate            DateTime?
+  endDate              DateTime?
+  productId            Int?
+  agreementData        AgreementData[]
+  contractorData       ContractorData?
+  dailyIssues          DailyIssueUpdate[]
+  dailyUpdates         DailyMaterialUpdate[]
+  dailySiteProgress    DailySiteProgressUpdate[]
+  extraMaterial        ExtraMaterial[]
+  materialTotal        MaterialTotal?
+  requests             Request[]
+  Product              Product?                  @relation(fields: [productId], references: [id])
+  updatedByUser        User?                     @relation("UpdatedByUser", fields: [updated_by], references: [id])
+  purchasers           SitePurchaser[]
+  seniorEngineers      SiteSeniorEngineer[]
+  supervisors          SiteSupervisor[]
+  stageMaterial        StageMaterial?
 }
 
 model DailyMaterialUpdate {
-  id        Int      @id @default(autoincrement())
-  siteId    Int
-  date      DateTime
-  rows      Json     @default("[]")
-  createdBy Int?
+  id            Int      @id @default(autoincrement())
+  siteId        Int
+  date          DateTime
+  updatedBy     Int?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  rows          Json     @default("[]")
+  createdBy     Int?
   createdByName String?
-  updatedBy Int?
   updatedByName String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  site          Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
 
   @@unique([siteId, date])
   @@index([siteId, date])
@@ -149,8 +105,7 @@ model DailyIssueUpdate {
   updatedByName String?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
-
-  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  site          Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
 
   @@unique([siteId, date])
   @@index([siteId, date])
@@ -168,8 +123,7 @@ model DailySiteProgressUpdate {
   updatedByName String?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
-
-  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  site          Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
 
   @@unique([siteId, date])
   @@index([siteId, date])
@@ -196,23 +150,23 @@ model AgreementData {
 }
 
 model Request {
-  id            Int           @id @default(autoincrement())
-  siteRequestId Int           @default(0)
+  id            Int            @id @default(autoincrement())
+  siteRequestId Int            @default(0)
   qty           Float
-  stageWiseQty  Json?
-  steelItes     Json?
-  sanitaryImage Json?
-  priority      String        @default("medium")
+  priority      String         @default("medium")
   releasedQty   Float?
-  receivedQty   Float?        @default(0)
-  status        RequestStatus @default(PENDING)
+  receivedQty   Float?         @default(0)
+  status        RequestStatus  @default(PENDING)
   siteId        Int
   stageName     StageName?
-  site          Site          @relation(fields: [siteId], references: [id])
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
   productId     Int
-  product       Product       @relation(fields: [productId], references: [id])
+  steelItes     Json?
+  sanitaryImage Json?
+  stageWiseQty  Json?
+  product       Product        @relation(fields: [productId], references: [id])
+  site          Site           @relation(fields: [siteId], references: [id])
   stages        RequestStage[]
 
   @@index([siteId, createdAt])
@@ -224,35 +178,34 @@ model Request {
 }
 
 model RequestImage {
-  id        Int      @id @default(autoincrement())
+  id        Int            @id @default(autoincrement())
   fileName  String
-  mimeType  String   @default("image/webp")
-  size      Int      @default(0)
+  mimeType  String         @default("image/webp")
+  size      Int            @default(0)
   data      Bytes
-  createdAt DateTime @default(now())
+  createdAt DateTime       @default(now())
   stages    RequestStage[]
 }
 
 model RequestStage {
-  id         Int       @id @default(autoincrement())
-  requestId  Int
-  stageName  StageName
-  status     String
-  comment    String?
-  userId     Int
+  id           Int           @id @default(autoincrement())
+  requestId    Int
+  stageName    StageName
+  status       String
+  comment      String?
+  userId       Int
+  receivedAt   DateTime?
+  forwardAt    DateTime?
   stageImageId Int?
-  receivedAt DateTime?
-  forwardAt  DateTime?
+  request      Request       @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  stageImage   RequestImage? @relation(fields: [stageImageId], references: [id])
+  user         User          @relation(fields: [userId], references: [id])
 
-  request Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
-  user    User    @relation(fields: [userId], references: [id])
-  stageImage RequestImage? @relation(fields: [stageImageId], references: [id])
-
+  @@unique([requestId, stageName])
   @@index([requestId])
   @@index([stageName, status])
   @@index([userId, status])
   @@index([stageImageId])
-  @@unique([requestId, stageName])
 }
 
 model MaterialTotal {
@@ -280,8 +233,8 @@ model ChatMember {
   groupId    Int
   joinedAt   DateTime  @default(now())
   lastSeenAt DateTime?
-  user       User      @relation(fields: [userId], references: [id])
   group      ChatGroup @relation(fields: [groupId], references: [id])
+  user       User      @relation(fields: [userId], references: [id])
 
   @@unique([userId, groupId])
 }
@@ -297,23 +250,23 @@ model Message {
   fileName      String?
   mimeType      String?
   senderId      Int
-  sender        User        @relation(fields: [senderId], references: [id], onDelete: Cascade)
   groupId       Int
-  group         ChatGroup   @relation(fields: [groupId], references: [id], onDelete: Cascade)
   createdAt     DateTime    @default(now())
+  group         ChatGroup   @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  sender        User        @relation(fields: [senderId], references: [id], onDelete: Cascade)
 }
 
 model ChatGroup {
   id          Int          @id @default(autoincrement())
   name        String
   createdById Int
-  createdBy   User         @relation("UserCreatedGroups", fields: [createdById], references: [id])
   createdAt   DateTime     @default(now())
-  members     ChatMember[]
-  messages    Message[]
-  User        User?        @relation(fields: [userId], references: [id])
   userId      Int?
   lastMessage String       @default("")
+  createdBy   User         @relation("UserCreatedGroups", fields: [createdById], references: [id])
+  User        User?        @relation(fields: [userId], references: [id])
+  members     ChatMember[]
+  messages    Message[]
 }
 
 model Notification {
@@ -335,14 +288,14 @@ model Notification {
 }
 
 model Product {
-  id            Int             @id @default(autoincrement())
-  unit          String
-  name          String
-  requests      Request[]
-  site          Site[]
-  extraMaterial ExtraMaterial[]
+  id             Int             @id @default(autoincrement())
+  unit           String
+  name           String
+  extraMaterial  ExtraMaterial[]
+  requests       Request[]
+  site           Site[]
+  stageItems     StageItem[]
   purchaserUsers UserProduct[]
-  stageItems    StageItem[]
 }
 
 model Stage {
@@ -360,18 +313,16 @@ model StageItem {
   qty       Float    @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
-  stage   Stage   @relation(fields: [stageId], references: [id], onDelete: Cascade)
-  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  stage     Stage    @relation(fields: [stageId], references: [id], onDelete: Cascade)
 }
 
 model UserProduct {
-  id        Int @id @default(autoincrement())
+  id        Int     @id @default(autoincrement())
   userId    Int
   productId Int
-
-  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
-  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, productId])
 }
@@ -385,43 +336,39 @@ model ExtraMaterial {
   amount       Float?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
-
-  site    Site    @relation(fields: [siteId], references: [id])
-  product Product @relation(fields: [productId], references: [id])
+  product      Product  @relation(fields: [productId], references: [id])
+  site         Site     @relation(fields: [siteId], references: [id])
 }
 
 model SiteSupervisor {
-  id     Int @id @default(autoincrement())
+  id     Int  @id @default(autoincrement())
   siteId Int
   userId Int
-
-  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  site   Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([siteId, userId])
 }
 
 model SitePurchaser {
-  id     Int @id @default(autoincrement())
-  siteId Int
-  userId Int
-  status String @default("active")
+  id          Int     @id @default(autoincrement())
+  siteId      Int
+  userId      Int
+  status      String  @default("active")
   allProducts Boolean @default(false)
-  productIds Int[] @default([])
-
-  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productIds  Int[]   @default([])
+  site        Site    @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([siteId, userId])
 }
 
 model SiteSeniorEngineer {
-  id     Int @id @default(autoincrement())
+  id     Int  @id @default(autoincrement())
   siteId Int
   userId Int
-
-  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  site   Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([siteId, userId])
 }
@@ -432,32 +379,31 @@ model PushSubscription {
   endpoint   String   @unique
   p256dh     String
   auth       String
-  deviceType String?  // mobile | tablet | desktop
-  userAgent  String?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
+  deviceType String?
+  userAgent  String?
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
 }
 
 model Task {
-  id          Int        @id @default(autoincrement())
-  name        String
-  description String?
-  assigned_to String?
-  contractor  String?
-  penalty     Float?
-  due_date    DateTime?
-  site_id     Int?
-  status      TaskStatus @default(TODO)
-  created_by  Int?
-  created_at  DateTime   @default(now())
-  updated_by  Int?
-  updated_at  DateTime   @updatedAt
-
-  createdByUser User?     @relation("TaskCreatedBy", fields: [created_by], references: [id], onDelete: SetNull)
-  updatedByUser User?     @relation("TaskUpdatedBy", fields: [updated_by], references: [id], onDelete: SetNull)
+  id            Int        @id @default(autoincrement())
+  name          String
+  description   String?
+  assigned_to   String?
+  contractor    String?
+  due_date      DateTime?
+  site_id       Int?
+  status        TaskStatus @default(TODO)
+  created_by    Int?
+  created_at    DateTime   @default(now())
+  updated_by    Int?
+  updated_at    DateTime   @updatedAt
+  penalty       Float?
+  createdByUser User?      @relation("TaskCreatedBy", fields: [created_by], references: [id])
+  updatedByUser User?      @relation("TaskUpdatedBy", fields: [updated_by], references: [id])
   logs          TaskLog[]
 
   @@index([status])
@@ -476,11 +422,53 @@ model TaskLog {
   to_value   String?
   meta       Json?
   created_at DateTime @default(now())
-
-  task  Task? @relation(fields: [task_id], references: [id], onDelete: SetNull)
-  actor User? @relation("TaskLogActor", fields: [actor_id], references: [id], onDelete: SetNull)
+  actor      User?    @relation("TaskLogActor", fields: [actor_id], references: [id])
+  task       Task?    @relation(fields: [task_id], references: [id])
 
   @@index([task_id])
   @@index([created_at])
   @@index([action])
+}
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  QA
+  ACCOUNT
+  DIRECTOR
+  SUPERVISOR
+  PURCHASER
+  SR_ENGINEER
+}
+
+enum RequestStatus {
+  PENDING
+  IN_PROGRESS
+  APPROVED
+  REJECTED
+  COMPLETED
+  CONFLICT
+}
+
+enum StageName {
+  QA
+  ACCOUNT
+  PURCHASER
+  SUPERVISOR
+  RECEIVING
+}
+
+enum MessageType {
+  TEXT
+  MEDIA
+  AUDIO
+  FILE
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DELAY
+  COMPLETE
+  DISCARDED
 }
