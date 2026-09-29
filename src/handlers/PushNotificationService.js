@@ -93,9 +93,10 @@ class PushNotificationService {
               appUrl: payload?.appUrl || this.getFrontendAppUrl(),
             }),
             {
-              // high = ask FCM/Android to deliver sooner (reduces 5–10 min Doze delays)
+              // high = ask FCM/Android to wake device sooner while idle/Doze
               urgency: "high",
-              TTL: 60 * 60, // keep message up to 1 hour if device is offline
+              // Keep long enough for offline/Doze phones to still receive later
+              TTL: 60 * 60 * 24,
             }
           );
           receivedSet.add(userId);
