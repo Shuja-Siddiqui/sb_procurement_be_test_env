@@ -83,7 +83,7 @@ class PushNotificationService {
           `[Notification][Push] SENDING user=${userId} device=${device} time=${new Date().toISOString()}`
         );
         try {
-          await webpush.sendNotification(
+          const res = await webpush.sendNotification(
             {
               endpoint: sub.endpoint,
               keys: { p256dh: sub.p256dh, auth: sub.auth },
@@ -99,10 +99,12 @@ class PushNotificationService {
               TTL: 60 * 60 * 24,
             }
           );
+
+          const host = new URL(sub.endpoint).host;
           receivedSet.add(userId);
-          byDevice.push({ userId, device, status: "RECEIVED", endpoint: sub.endpoint.slice(0, 60) });
+          byDevice.push({ userId, device, host, status: "ACCEPTED", endpoint: sub.endpoint.slice(0, 60) });
           console.log(
-            `[Notification][Push] RECEIVED user=${userId} device=${device} endpoint=${sub.endpoint.slice(0, 60)}...`
+            `[Notification][Push] ACCEPTED user=${userId} device=${device} host=${host} status=${res.statusCode} took=${Date.now() - pushStartTime}ms`
           );
         } catch (error) {
           const statusCode = error?.statusCode;
