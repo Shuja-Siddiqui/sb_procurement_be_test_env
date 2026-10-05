@@ -1,4 +1,5 @@
 const router = require("express").Router();
+const redisCache = require("../middleware/redisCache");
 const user = require("./user");
 const site = require("./site");
 const request = require("./request");
@@ -14,6 +15,9 @@ const contractorData = require("./contractorData");
 const agreementData = require("./agreementData");
 const dailyUpdate = require("./dailyUpdate");
 const task = require("./task");
+
+// Redis for all /api/v1 methods (GET cache after auth; POST/PUT/PATCH/DELETE invalidate)
+router.use(redisCache);
 
 router.use("/user", user);
 router.use("/site", site);

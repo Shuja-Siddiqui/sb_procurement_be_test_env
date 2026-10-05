@@ -631,6 +631,57 @@ class DailyUpdate extends Response {
     }
   };
 
+  parseSiteIdsQuery = (raw) => {
+    if (raw == null || raw === "") return [];
+    return String(raw)
+      .split(",")
+      .map((id) => Number(String(id).trim()))
+      .filter((id) => Number.isFinite(id) && id > 0);
+  };
+
+  getAllIssuesHistory = async (req, res) => {
+    try {
+      if (!this.hasDailyUpdateAccess(req?.user?.role)) {
+        return this.sendResponse(req, res, {
+          message:
+            "Only admin, supervisor, super admin, site engineer, and director can access daily updates",
+          status: 403,
+        });
+      }
+
+      const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+      const siteIds = this.parseSiteIdsQuery(req.query.siteIds);
+
+      const where = siteIds.length > 0 ? { siteId: { in: siteIds } } : {};
+
+      const records = await prisma.dailyIssueUpdate.findMany({
+        where,
+        include: {
+          site: { select: { id: true, name: true } },
+        },
+        orderBy: [{ updatedAt: "desc" }, { date: "desc" }],
+        take: limit,
+      });
+
+      const data = records.map((record) => ({
+        ...record,
+        siteName: record.site?.name || `Site #${record.siteId}`,
+      }));
+
+      return this.sendResponse(req, res, {
+        message: "All daily issues history fetched successfully",
+        status: 200,
+        data,
+      });
+    } catch (error) {
+      console.error("Error in get all daily issues history:", error);
+      return this.sendResponse(req, res, {
+        message: "Failed to fetch all daily issues history",
+        status: 500,
+      });
+    }
+  };
+
   upsertSiteProgressBySiteDate = async (req, res) => {
     try {
       if (!this.hasDailyUpdateAccess(req?.user?.role)) {
@@ -779,6 +830,49 @@ class DailyUpdate extends Response {
       console.error("Error in get daily site progress history:", error);
       return this.sendResponse(req, res, {
         message: "Failed to fetch daily site progress history",
+        status: 500,
+      });
+    }
+  };
+
+  getAllSiteProgressHistory = async (req, res) => {
+    try {
+      if (!this.hasDailyUpdateAccess(req?.user?.role)) {
+        return this.sendResponse(req, res, {
+          message:
+            "Only admin, supervisor, super admin, site engineer, and director can access daily updates",
+          status: 403,
+        });
+      }
+
+      const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+      const siteIds = this.parseSiteIdsQuery(req.query.siteIds);
+
+      const where = siteIds.length > 0 ? { siteId: { in: siteIds } } : {};
+
+      const records = await prisma.dailySiteProgressUpdate.findMany({
+        where,
+        include: {
+          site: { select: { id: true, name: true } },
+        },
+        orderBy: [{ updatedAt: "desc" }, { date: "desc" }],
+        take: limit,
+      });
+
+      const data = records.map((record) => ({
+        ...record,
+        siteName: record.site?.name || `Site #${record.siteId}`,
+      }));
+
+      return this.sendResponse(req, res, {
+        message: "All daily site progress history fetched successfully",
+        status: 200,
+        data,
+      });
+    } catch (error) {
+      console.error("Error in get all daily site progress history:", error);
+      return this.sendResponse(req, res, {
+        message: "Failed to fetch all daily site progress history",
         status: 500,
       });
     }

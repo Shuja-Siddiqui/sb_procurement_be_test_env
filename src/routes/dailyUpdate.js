@@ -6,9 +6,11 @@ const handler = new DailyUpdate();
 
 router.post("/", authenticateJWT, handler.upsertBySiteDate);
 router.post("/issues", authenticateJWT, handler.upsertIssuesBySiteDate);
+router.get("/issues/history", authenticateJWT, handler.getAllIssuesHistory);
 router.get("/issues/:siteId/history", authenticateJWT, handler.getIssuesHistoryBySite);
 router.get("/issues/:siteId", authenticateJWT, handler.getIssuesBySiteDate);
 router.post("/site-progress", authenticateJWT, handler.upsertSiteProgressBySiteDate);
+router.get("/site-progress/history", authenticateJWT, handler.getAllSiteProgressHistory);
 router.get("/site-progress/:siteId/history", authenticateJWT, handler.getSiteProgressHistoryBySite);
 router.get("/site-progress/:siteId", authenticateJWT, handler.getSiteProgressBySiteDate);
 router.get("/:siteId/history", authenticateJWT, handler.getHistoryBySite);

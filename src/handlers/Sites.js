@@ -233,6 +233,7 @@ class Site extends Response {
     try {
       const userId = req?.user?.id;
       const userRole = req?.user?.role;
+
       const allSites = await prisma.site.findMany({
         orderBy: { created_at: "desc" },
         include: siteAssigneesInclude,

@@ -422,6 +422,14 @@ class Users extends Response {
         });
       }
 
+      const userStatus = String(user.status || "").trim().toLowerCase();
+      if (userStatus && userStatus !== "active") {
+        return this.sendResponse(req, res, {
+          status: 401,
+          message: "User account is inactive",
+        });
+      }
+
       // Compare password
       const isMatch = await bcrypt.compare(password, user.password);
       if (!isMatch) {
