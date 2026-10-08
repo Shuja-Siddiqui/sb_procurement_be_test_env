@@ -6,6 +6,9 @@ const handler = new Users();
 
 router.post('/', authenticateJWT, handler.createUser);
 router.post('/login', handler.signIn);
+router.post('/forgot-password', handler.forgotPassword);
+router.post('/verify-reset-code', handler.verifyResetCode);
+router.post('/reset-password', handler.resetPassword);
 router.get('/', authenticateJWT, handler.getUsers);
 router.put('/me/password', authenticateJWT, handler.changeOwnPassword);
 router.get('/:id', authenticateJWT, handler.getUserById);

@@ -1,7 +1,8 @@
 const { MessageType } = require("@prisma/client");
 const prisma = require("../lib/prisma");
 const Response = require("./Response");
-const { getSocket } = require("../socket");
+// Socket.IO disabled — chat realtime via Supabase postgres_changes on "Message".
+// const { getSocket } = require("../socket");
 
 class Chat extends Response {
   // Create a group
@@ -140,9 +141,9 @@ class Chat extends Response {
         where: { groupId, userId: parseInt(senderId) },
         data: { lastSeenAt: new Date() },
       });
-      const io = getSocket();
-      io.to(groupId.toString()).emit("new_message", message);
-      io.emit("send_message", message);
+      // const io = getSocket();
+      // io.to(groupId.toString()).emit("new_message", message);
+      // io.emit("send_message", message);
 
       return res.status(201).json(message);
     } catch (error) {

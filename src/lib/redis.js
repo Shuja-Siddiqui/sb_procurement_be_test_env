@@ -39,6 +39,18 @@ const safeSet = async (key, value, ttlSeconds = GET_TTL_SECONDS) => {
   }
 };
 
+const safeDel = async (key) => {
+  const redis = getRedis();
+  if (!redis) return false;
+  try {
+    await redis.del(key);
+    return true;
+  } catch (error) {
+    console.error("[redis] del failed:", error?.message || error);
+    return false;
+  }
+};
+
 const getVersion = async () => {
   const redis = getRedis();
   if (!redis) return 0;
@@ -105,6 +117,7 @@ module.exports = {
   getRedis,
   safeGet,
   safeSet,
+  safeDel,
   getVersion,
   invalidateAllGetCache,
   buildGetCacheKey,

@@ -60,6 +60,61 @@ const siteAssigneesInclude = {
   },
 };
 
+const buildSiteAccessWhere = (userId, userRole) => {
+  const parsedUserId = Number(userId);
+  if (!Number.isFinite(parsedUserId)) return {};
+  if (userRole === Role.SUPERVISOR) {
+    return { supervisors: { some: { userId: parsedUserId } } };
+  }
+  if (userRole === Role.PURCHASER) {
+    return { purchasers: { some: { userId: parsedUserId } } };
+  }
+  if (userRole === Role.SR_ENGINEER) {
+    return { seniorEngineers: { some: { userId: parsedUserId } } };
+  }
+  return {};
+};
+
+const normalizeStatusFilter = (status) => {
+  const normalized = String(status || "")
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, "-");
+  if (!normalized) return null;
+  if (normalized === "data uploading" || normalized === "pending") {
+    return { in: ["pending", "data uploading"] };
+  }
+  if (normalized === "in-progress" || normalized === "in progress") {
+    return { in: ["in-progress", "in progress"] };
+  }
+  if (normalized === "completed") {
+    return { equals: "completed" };
+  }
+  return { equals: String(status).trim() };
+};
+
+const buildStatusCounts = (rows = []) => {
+  const counts = {
+    all: 0,
+    uploading: 0,
+    inProgress: 0,
+    completed: 0,
+  };
+  rows.forEach((row) => {
+    const count = Number(row?._count?._all || 0);
+    counts.all += count;
+    const status = String(row?.status || "").toLowerCase();
+    if (status === "pending" || status === "data uploading") {
+      counts.uploading += count;
+    } else if (status === "in-progress" || status === "in progress") {
+      counts.inProgress += count;
+    } else if (status === "completed") {
+      counts.completed += count;
+    }
+  });
+  return counts;
+};
+
 class Site extends Response {
   getAssignableUsers = async (req, res) => {
     try {
@@ -233,34 +288,121 @@ class Site extends Response {
     try {
       const userId = req?.user?.id;
       const userRole = req?.user?.role;
+      const accessWhere = buildSiteAccessWhere(userId, userRole);
 
-      const allSites = await prisma.site.findMany({
+      const pageParam = req.query.page;
+      const limitParam = req.query.limit;
+      const usePagination = pageParam != null || limitParam != null;
+
+      // Backward compatible: callers without page/limit still get a full array.
+      if (!usePagination) {
+        const allSites = await prisma.site.findMany({
+          where: accessWhere,
+          orderBy: { created_at: "desc" },
+          include: siteAssigneesInclude,
+        });
+
+        return this.sendResponse(req, res, {
+          message: "Sites fetched successfully",
+          status: 200,
+          data: allSites,
+        });
+      }
+
+      const page = Math.max(1, parseInt(pageParam, 10) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(limitParam, 10) || 10));
+
+      const search = String(req.query.search || "").trim();
+      const city = String(req.query.city || "").trim();
+      const province = String(req.query.province || "").trim();
+      const plotSize = String(
+        req.query.plot_size || req.query.plotSize || "",
+      ).trim();
+      const statusFilter = normalizeStatusFilter(req.query.status);
+
+      const listWhere = { ...accessWhere };
+      if (search) {
+        listWhere.OR = [
+          { name: { contains: search, mode: "insensitive" } },
+          { client_name: { contains: search, mode: "insensitive" } },
+          { city: { contains: search, mode: "insensitive" } },
+          { province: { contains: search, mode: "insensitive" } },
+          { plot_size: { contains: search, mode: "insensitive" } },
+        ];
+      }
+      if (city) {
+        listWhere.city = { equals: city, mode: "insensitive" };
+      }
+      if (province) {
+        listWhere.province = { equals: province, mode: "insensitive" };
+      }
+      if (plotSize) {
+        listWhere.plot_size = { equals: plotSize, mode: "insensitive" };
+      }
+      if (statusFilter) {
+        listWhere.status = statusFilter;
+      }
+
+      // Tab counts ignore status filter so each tab total stays correct.
+      const tabCountWhere = { ...listWhere };
+      delete tabCountWhere.status;
+
+      const [total, statusGroups, filterRows] = await Promise.all([
+        prisma.site.count({ where: listWhere }),
+        prisma.site.groupBy({
+          by: ["status"],
+          where: tabCountWhere,
+          _count: { _all: true },
+        }),
+        prisma.site.findMany({
+          where: accessWhere,
+          select: { city: true, province: true, plot_size: true },
+        }),
+      ]);
+
+      const totalPages = Math.max(1, Math.ceil(total / limit) || 1);
+      const safePage = Math.min(page, totalPages);
+      const skip = (safePage - 1) * limit;
+
+      const sites = await prisma.site.findMany({
+        where: listWhere,
         orderBy: { created_at: "desc" },
         include: siteAssigneesInclude,
+        skip,
+        take: limit,
       });
 
-      const filteredSites = allSites.filter((site) => {
-        if (userRole === Role.SUPERVISOR) {
-          return site.supervisors.some((s) => s.userId === userId);
-        }
-        if (userRole === Role.PURCHASER) {
-          return site.purchasers.some((p) => p.userId === userId);
-        }
-        if (userRole === Role.SR_ENGINEER) {
-          return site.seniorEngineers.some((p) => p.userId === userId);
-        }
-        return true;
-      });
+      const uniqueSorted = (values) =>
+        [...new Set(values.map((v) => String(v || "").trim()).filter(Boolean))].sort(
+          (a, b) => a.localeCompare(b),
+        );
 
       return this.sendResponse(req, res, {
         message: "Sites fetched successfully",
         status: 200,
-        data: filteredSites,
+        data: {
+          items: sites,
+          pagination: {
+            page: safePage,
+            limit,
+            total,
+            totalPages,
+            from: total === 0 ? 0 : skip + 1,
+            to: Math.min(skip + sites.length, total),
+          },
+          statusCounts: buildStatusCounts(statusGroups),
+          filterOptions: {
+            cities: uniqueSorted(filterRows.map((row) => row.city)),
+            provinces: uniqueSorted(filterRows.map((row) => row.province)),
+            plotSizes: uniqueSorted(filterRows.map((row) => row.plot_size)),
+          },
+        },
       });
     } catch (error) {
       return this.sendResponse(req, res, {
         message: "Failed to fetch sites",
         status: 500,
+        error: error.message,
       });
     }
   };
