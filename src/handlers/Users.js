@@ -1,8 +1,68 @@
+const crypto = require("crypto");
 const prisma = require("../lib/prisma");
 const Response = require("./Response");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { Role } = require("@prisma/client");
+const { safeGet, safeSet, safeDel } = require("../lib/redis");
+const { sendPasswordResetOtpEmail } = require("../lib/mail");
+
+const RESET_OTP_TTL_SECONDS = 10 * 60;
+const RESET_TOKEN_TTL = "15m";
+const RESET_MAX_ATTEMPTS = 5;
+const memoryResetStore = new Map();
+
+const otpKey = (userId) => `pwd-reset:otp:${userId}`;
+const attemptsKey = (userId) => `pwd-reset:attempts:${userId}`;
+
+const hashOtp = (code) =>
+  crypto.createHash("sha256").update(String(code)).digest("hex");
+
+const maskEmail = (email) => {
+  const value = String(email || "").trim().toLowerCase();
+  const at = value.indexOf("@");
+  if (at <= 0) return "****";
+  const local = value.slice(0, at);
+  const domain = value.slice(at + 1);
+  const visible =
+    local.length <= 2 ? `${local[0] || "*"}*` : `${local.slice(0, 2)}***`;
+  return `${visible}@${domain}`;
+};
+
+const isDeliverableEmail = (email) => {
+  const value = String(email || "").trim().toLowerCase();
+  if (!value || !value.includes("@")) return false;
+  if (value.endsWith("@sbprocurement.local")) return false;
+  return true;
+};
+
+const storeResetPayload = async (key, value, ttlSeconds) => {
+  const saved = await safeSet(key, value, ttlSeconds);
+  if (!saved) {
+    memoryResetStore.set(key, {
+      value,
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+  }
+};
+
+const readResetPayload = async (key) => {
+  const fromRedis = await safeGet(key);
+  if (fromRedis != null) return fromRedis;
+
+  const local = memoryResetStore.get(key);
+  if (!local) return null;
+  if (Date.now() > local.expiresAt) {
+    memoryResetStore.delete(key);
+    return null;
+  }
+  return local.value;
+};
+
+const clearResetPayload = async (key) => {
+  await safeDel(key);
+  memoryResetStore.delete(key);
+};
 
 const toRoleEnum = (role) => {
   if (!role) return undefined;
@@ -35,8 +95,15 @@ class Users extends Response {
       .map((id) => Number(id))
       .filter((id) => Number.isFinite(id));
 
-  checkUserDuplicates = async ({ name, number, cnic, excludeUserId = null }) => {
+  checkUserDuplicates = async ({
+    name,
+    email,
+    number,
+    cnic,
+    excludeUserId = null,
+  }) => {
     const trimmedName = String(name || "").trim();
+    const trimmedEmail = String(email || "").trim().toLowerCase();
     const trimmedNumber = String(number || "").trim();
     const trimmedCnic = String(cnic || "").trim();
     const exclude =
@@ -54,6 +121,17 @@ class Users extends Response {
         select: { id: true },
       });
       if (existingByName) conflicts.push("name");
+    }
+
+    if (trimmedEmail) {
+      const existingByEmail = await prisma.user.findFirst({
+        where: {
+          ...exclude,
+          email: { equals: trimmedEmail, mode: "insensitive" },
+        },
+        select: { id: true },
+      });
+      if (existingByEmail) conflicts.push("email");
     }
 
     if (trimmedNumber) {
@@ -93,9 +171,22 @@ class Users extends Response {
           message: "Only Super Admin, Director, or Admin can manage users",
         });
       }
-      const { name, password, role, cnic, gender, number, status, alreadyAssigned, isEdit } = req.body;
+      const { name, email, password, role, cnic, gender, number, status, alreadyAssigned, isEdit } = req.body;
+      const trimmedEmail = String(email || "").trim().toLowerCase();
 
-      const duplicateFields = await this.checkUserDuplicates({ name, number, cnic });
+      if (!trimmedEmail) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Email is required",
+        });
+      }
+
+      const duplicateFields = await this.checkUserDuplicates({
+        name,
+        email: trimmedEmail,
+        number,
+        cnic,
+      });
       if (duplicateFields.length > 0) {
         return this.sendResponse(req, res, {
           status: 409,
@@ -112,7 +203,7 @@ class Users extends Response {
       const user = await prisma.user.create({
         data: {
           name,
-          email: this.buildInternalEmail({ name, number }),
+          email: trimmedEmail,
           password: hashedPassword,
           role: roleEnum,
           purchaserAllProducts: roleEnum === Role.PURCHASER ? purchaserAllProducts : false,
@@ -246,10 +337,20 @@ class Users extends Response {
         });
       }
       const { id } = req.params;
-      const { name, password, role, cnic, gender, number, status, alreadyAssigned, isEdit } = req.body;
+      const { name, email, password, role, cnic, gender, number, status, alreadyAssigned, isEdit } = req.body;
+      const trimmedEmail =
+        email !== undefined ? String(email || "").trim().toLowerCase() : undefined;
+
+      if (email !== undefined && !trimmedEmail) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Email is required",
+        });
+      }
 
       const duplicateFields = await this.checkUserDuplicates({
         name,
+        email: trimmedEmail,
         number,
         cnic,
         excludeUserId: parseInt(id),
@@ -269,6 +370,7 @@ class Users extends Response {
           : undefined;
       const data = {
         ...(name !== undefined ? { name } : {}),
+        ...(trimmedEmail !== undefined ? { email: trimmedEmail } : {}),
         ...(cnic !== undefined ? { cnic } : {}),
         ...(gender !== undefined ? { gender } : {}),
         ...(number !== undefined ? { number } : {}),
@@ -422,6 +524,14 @@ class Users extends Response {
         });
       }
 
+      const userStatus = String(user.status || "").trim().toLowerCase();
+      if (userStatus && userStatus !== "active") {
+        return this.sendResponse(req, res, {
+          status: 401,
+          message: "User account is inactive",
+        });
+      }
+
       // Compare password
       const isMatch = await bcrypt.compare(password, user.password);
       if (!isMatch) {
@@ -532,6 +642,251 @@ class Users extends Response {
         status: 400,
         message: "Failed to update password",
         error: error.message,
+      });
+    }
+  };
+
+  findUserByIdentifier = async (identifier) => {
+    const cleanIdentifier = String(identifier || "").trim();
+    if (!cleanIdentifier) return null;
+
+    return prisma.user.findFirst({
+      where: {
+        OR: [
+          { number: cleanIdentifier },
+          { name: { equals: cleanIdentifier, mode: "insensitive" } },
+          { email: { equals: cleanIdentifier, mode: "insensitive" } },
+        ],
+      },
+    });
+  };
+
+  // Step 1: request verification code for password reset (email OTP)
+  forgotPassword = async (req, res) => {
+    try {
+      const { identifier } = req.body;
+      if (!identifier || !String(identifier).trim()) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Username, phone, or email is required",
+        });
+      }
+
+      const user = await this.findUserByIdentifier(identifier);
+      if (!user) {
+        return this.sendResponse(req, res, {
+          status: 404,
+          message: "No account found with this username, phone, or email",
+        });
+      }
+
+      const userStatus = String(user.status || "").trim().toLowerCase();
+      if (userStatus && userStatus !== "active") {
+        return this.sendResponse(req, res, {
+          status: 401,
+          message: "User account is inactive",
+        });
+      }
+
+      if (!isDeliverableEmail(user.email)) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message:
+            "No valid email is linked to this account. Please contact your administrator.",
+        });
+      }
+
+      const code = String(crypto.randomInt(100000, 1000000));
+      await storeResetPayload(
+        otpKey(user.id),
+        { hash: hashOtp(code), userId: user.id },
+        RESET_OTP_TTL_SECONDS
+      );
+      await clearResetPayload(attemptsKey(user.id));
+
+      const expiresMinutes = Math.ceil(RESET_OTP_TTL_SECONDS / 60);
+      const mailResult = await sendPasswordResetOtpEmail({
+        to: user.email,
+        name: user.name,
+        code,
+        expiresMinutes,
+      });
+
+      const isDev = String(process.env.NODE_ENV || "").toLowerCase() !== "production";
+      const responseData = {
+        maskedEmail: maskEmail(user.email),
+        expiresInSeconds: RESET_OTP_TTL_SECONDS,
+      };
+
+      if (!mailResult.sent) {
+        console.log(
+          `[password-reset] SMTP not configured — OTP for user=${user.id} email=${user.email}: ${code}`
+        );
+        if (!isDev) {
+          return this.sendResponse(req, res, {
+            status: 503,
+            message:
+              "Email service is not configured. Please contact your administrator.",
+          });
+        }
+        responseData.devVerificationCode = code;
+      }
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Verification code sent to your email",
+        data: responseData,
+      });
+    } catch (error) {
+      console.error("Forgot password error:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to send verification code",
+      });
+    }
+  };
+
+  // Step 2: verify OTP and issue short-lived reset token
+  verifyResetCode = async (req, res) => {
+    try {
+      const { identifier, code } = req.body;
+      if (!identifier || !code) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Account identifier and verification code are required",
+        });
+      }
+
+      const cleanCode = String(code).trim();
+      if (!/^\d{6}$/.test(cleanCode)) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Verification code must be 6 digits",
+        });
+      }
+
+      const user = await this.findUserByIdentifier(identifier);
+      if (!user) {
+        return this.sendResponse(req, res, {
+          status: 404,
+          message: "No account found with this username, phone, or email",
+        });
+      }
+
+      const attemptsRaw = await readResetPayload(attemptsKey(user.id));
+      const attempts = Number(attemptsRaw) || 0;
+      if (attempts >= RESET_MAX_ATTEMPTS) {
+        await clearResetPayload(otpKey(user.id));
+        return this.sendResponse(req, res, {
+          status: 429,
+          message: "Too many invalid attempts. Please request a new code.",
+        });
+      }
+
+      const stored = await readResetPayload(otpKey(user.id));
+      const storedHash =
+        typeof stored === "object" && stored ? stored.hash : stored;
+
+      if (!storedHash || storedHash !== hashOtp(cleanCode)) {
+        await storeResetPayload(
+          attemptsKey(user.id),
+          attempts + 1,
+          RESET_OTP_TTL_SECONDS
+        );
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Invalid or expired verification code",
+        });
+      }
+
+      await clearResetPayload(otpKey(user.id));
+      await clearResetPayload(attemptsKey(user.id));
+
+      const resetToken = jwt.sign(
+        {
+          id: user.id,
+          purpose: "password-reset",
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: RESET_TOKEN_TTL }
+      );
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Verification successful",
+        data: { resetToken },
+      });
+    } catch (error) {
+      console.error("Verify reset code error:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to verify code",
+      });
+    }
+  };
+
+  // Step 3: set a new password using reset token
+  resetPassword = async (req, res) => {
+    try {
+      const { resetToken, newPassword } = req.body;
+
+      if (!resetToken || !newPassword) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Reset token and new password are required",
+        });
+      }
+
+      if (String(newPassword).length < 6) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "New password must be at least 6 characters",
+        });
+      }
+
+      let decoded;
+      try {
+        decoded = jwt.verify(resetToken, process.env.JWT_SECRET);
+      } catch {
+        return this.sendResponse(req, res, {
+          status: 401,
+          message: "Reset session expired. Please request a new code.",
+        });
+      }
+
+      if (decoded?.purpose !== "password-reset" || !decoded?.id) {
+        return this.sendResponse(req, res, {
+          status: 401,
+          message: "Invalid reset token",
+        });
+      }
+
+      const userId = Number(decoded.id);
+      const user = await prisma.user.findUnique({ where: { id: userId } });
+      if (!user) {
+        return this.sendResponse(req, res, {
+          status: 404,
+          message: "User not found",
+        });
+      }
+
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(String(newPassword), salt);
+
+      await prisma.user.update({
+        where: { id: userId },
+        data: { password: hashedPassword },
+      });
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Password reset successfully",
+      });
+    } catch (error) {
+      console.error("Reset password error:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to reset password",
       });
     }
   };

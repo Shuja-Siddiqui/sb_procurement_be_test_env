@@ -1,3 +1,7 @@
+// Socket.IO module retained for possible future use.
+// Currently disabled from app.js (initSocket commented out).
+// Clients use Supabase Realtime for notifications, chat, and tasks.
+
 let io = null;
 
 function initSocket(server) {

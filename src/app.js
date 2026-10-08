@@ -3,11 +3,12 @@ const { env } = require("./config/env");
 // Required Imports
 const express = require("express");
 const http = require("http"); // ✅ import http
-const { initSocket } = require("./socket");
+// Socket.IO kept for possible future use — currently replaced by Supabase Realtime on the client.
+// const { initSocket } = require("./socket");
 const cors = require("cors");
 const routes = require("./routes");
 const expressFileUpload = require("express-fileupload");
-const { Server } = require("socket.io"); // ✅ import socket.io
+// const { Server } = require("socket.io"); // ✅ import socket.io
 
 const app = express();
 const server = http.createServer(app); // ✅ create server using http
@@ -60,7 +61,7 @@ app.use("/api/v1", routes);
 //   });
 // });
 
-initSocket(server); // ✅ Initialize socket
+// initSocket(server); // ✅ Initialize socket (disabled — using Supabase Realtime)
 
 // Start server
 // if (process.env.NODE_ENV === "local") {

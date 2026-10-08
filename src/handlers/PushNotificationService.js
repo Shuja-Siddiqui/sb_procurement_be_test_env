@@ -1,7 +1,8 @@
 const { Role } = require("@prisma/client");
 const Response = require("./Response");
 const webpush = require("web-push");
-const { emitToUsers } = require("../socket");
+// Socket.IO disabled — notification realtime via Supabase postgres_changes on "Notification".
+// const { emitToUsers } = require("../socket");
 
 const prisma = require("../lib/prisma");
 
@@ -421,35 +422,42 @@ class PushNotificationService {
       data,
     });
 
-    const realtimePayload = {
-      title,
-      body,
-      type,
-      data,
-      senderId,
-      recipientIds: uniqueRecipientIds,
-      createdAt: new Date().toISOString(),
-    };
+    // const realtimePayload = {
+    //   title,
+    //   body,
+    //   type,
+    //   data,
+    //   senderId,
+    //   recipientIds: uniqueRecipientIds,
+    //   createdAt: new Date().toISOString(),
+    // };
 
-    // Room-targeted emit (preferred)
-    emitToUsers(uniqueRecipientIds, "notification:new", realtimePayload);
+    // Room-targeted emit (preferred) — disabled; clients use Supabase Realtime on Notification rows.
+    // emitToUsers(uniqueRecipientIds, "notification:new", realtimePayload);
 
     // Broadcast fallback so clients still receive even if a user room join was missed.
-    try {
-      const { emitBroadcast } = require("../socket");
-      emitBroadcast("notification:new", realtimePayload);
-    } catch (error) {
-      console.error(
-        "[Notification][Socket] broadcast fallback failed:",
-        error?.message || error
-      );
-    }
+    // try {
+    //   const { emitBroadcast } = require("../socket");
+    //   emitBroadcast("notification:new", realtimePayload);
+    // } catch (error) {
+    //   console.error(
+    //     "[Notification][Socket] broadcast fallback failed:",
+    //     error?.message || error
+    //   );
+    // }
 
-    console.log("[Notification][Socket] emitted notification:new", {
+    // console.log("[Notification][Socket] emitted notification:new", {
+    //   event,
+    //   type,
+    //   recipientIds: uniqueRecipientIds,
+    //   senderId,
+    // });
+    console.log("[Notification][Realtime] DB rows saved; clients subscribe via Supabase", {
       event,
       type,
       recipientIds: uniqueRecipientIds,
       senderId,
+      savedCount: filteredRows.length,
     });
 
     console.log("[Notification][Dispatch] final", {
@@ -497,6 +505,28 @@ class PushNotificationService {
 
     recipientIds.delete(Number(senderId));
     return Array.from(recipientIds).filter((id) => Number.isFinite(id) && id > 0);
+  };
+
+  getMaterialRequestStages = (payload = {}) =>
+    Array.isArray(payload?.stages) ? payload.stages : [];
+
+  findMaterialRequestStage = (payload, stageName) => {
+    const target = String(stageName || "").toUpperCase();
+    return this.getMaterialRequestStages(payload).find(
+      (stage) => String(stage?.stageName || "").toUpperCase() === target
+    );
+  };
+
+  /** Workflow step assignees plus QA assignee once QA has approved. */
+  addMaterialRequestStageAssignees = (payload, addIfValid) => {
+    const qaStage = this.findMaterialRequestStage(payload, "QA");
+    const qaStatus = String(qaStage?.status || "").toUpperCase();
+    if (qaStatus === "APPROVED") {
+      addIfValid(qaStage?.userId ?? qaStage?.user_id);
+    }
+    this.getMaterialRequestStages(payload).forEach((stage) => {
+      addIfValid(stage?.userId ?? stage?.user_id);
+    });
   };
 
   sendNotificationToUserUploadFile = async (req, res) => {
@@ -760,36 +790,29 @@ class PushNotificationService {
         }
       }
 
-      // Stage-wise routing (strict role targeting):
-      // - created/pending/updated: QA + ADMIN + SUPER_ADMIN
-      // - qa_approved: ACCOUNT
-      // - account_approved: PURCHASER
-      // Other actions keep existing broad fallback behavior.
-      // NOTE: Clear previously collected stage user IDs for these explicit actions
-      // so Purchaser doesn't receive created/qa_approved events.
-      if (["created", "pending", "updated"].includes(action)) {
+      const applyAdminSuperAdminStageRecipients = async (extraRoles = []) => {
         selectedRecipientIds.clear();
-        await addUsersByRoles([Role.QA, Role.ADMIN, Role.SUPER_ADMIN]);
+        const roles = [Role.ADMIN, Role.SUPER_ADMIN, ...extraRoles];
+        await addUsersByRoles(roles);
+        this.addMaterialRequestStageAssignees(payload, addIfValid);
+      };
+
+      // Material request notifications: ADMIN + SUPER_ADMIN, workflow step assignees,
+      // and the QA assignee when QA is approved. QA approval also notifies all ACCOUNT users.
+      // Purchaser release notifies ADMIN, SUPER_ADMIN, SUPERVISOR, QA, and ACCOUNT.
+      if (action === "released") {
+        selectedRecipientIds.clear();
+        await addUsersByRoles([
+          Role.ADMIN,
+          Role.SUPER_ADMIN,
+          Role.SUPERVISOR,
+          Role.QA,
+          Role.ACCOUNT,
+        ]);
       } else if (action === "qa_approved") {
-        selectedRecipientIds.clear();
-        await addUsersByRoles([Role.ACCOUNT]);
-      } else if (action === "account_approved") {
-        selectedRecipientIds.clear();
-        await addUsersByRoles([Role.PURCHASER]);
-      } else if (action === "released") {
-        selectedRecipientIds.clear();
-        await addUsersByRoles([Role.ACCOUNT]);
-        const siteId = Number(payload?.siteId);
-        if (Number.isFinite(siteId) && siteId > 0) {
-          const siteSupervisors = await prisma.siteSupervisor.findMany({
-            where: { siteId },
-            select: { userId: true },
-          });
-          siteSupervisors.forEach((u) => addIfValid(u.userId));
-        }
+        await applyAdminSuperAdminStageRecipients([Role.ACCOUNT]);
       } else {
-        const siteRelatedRecipientIds = await this.getSiteRelatedRecipientIds(payload?.siteId, senderId);
-        siteRelatedRecipientIds.forEach((id) => selectedRecipientIds.add(id));
+        await applyAdminSuperAdminStageRecipients();
       }
 
       const recipientIds = Array.from(selectedRecipientIds);
