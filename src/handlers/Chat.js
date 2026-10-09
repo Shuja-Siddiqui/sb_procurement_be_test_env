@@ -5,7 +5,7 @@ const Response = require("./Response");
 // const { getSocket } = require("../socket");
 
 class Chat extends Response {
-  // Create a group
+  // Create a group chat
   createGroup = async (req, res) => {
     try {
       const { name, createdById } = req.body;
