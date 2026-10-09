@@ -25,7 +25,9 @@ class PushNotificationService {
   }
 
   getFrontendAppUrl = () =>
-    String(process.env.FRONTEND_APP_URL || "https://sb-procurement-fe-v2.vercel.app").replace(/\/+$/, "");
+    String(
+      process.env.FRONTEND_APP_URL || "https://sb-procurement-fe-test-env.vercel.app"
+    ).replace(/\/+$/, "");
 
   sendPushToUsers = async (userIds = [], payload = {}) => {
     const targetUserIds = [...new Set((userIds || []).map((id) => Number(id)))]
