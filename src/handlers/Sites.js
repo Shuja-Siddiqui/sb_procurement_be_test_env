@@ -615,6 +615,121 @@ class Site extends Response {
     }
   };
 
+  updateCurrentStage = async (req, res) => {
+    try {
+      const siteId = Number(req.params.id);
+      const userId = req?.user?.id;
+      const userRole = req?.user?.role;
+      const currentStage = req.body?.currentStage;
+
+      if (currentStage === undefined || currentStage === null || currentStage === "") {
+        return this.sendResponse(req, res, {
+          message: "currentStage is required",
+          status: 400,
+        });
+      }
+
+      const existingSite = await prisma.site.findUnique({
+        where: { id: siteId },
+        select: {
+          id: true,
+          name: true,
+          currentStage: true,
+          supervisors: { select: { userId: true } },
+        },
+      });
+
+      if (!existingSite) {
+        return this.sendResponse(req, res, { message: "Site not found", status: 404 });
+      }
+
+      const isAdmin = userRole === Role.ADMIN || userRole === Role.SUPER_ADMIN;
+      const isAssignedSupervisor =
+        userRole === Role.SUPERVISOR &&
+        existingSite.supervisors?.some((s) => s.userId === userId);
+
+      if (!isAdmin && !isAssignedSupervisor) {
+        return this.sendResponse(req, res, {
+          message: "Unauthorized to update current stage",
+          status: 403,
+        });
+      }
+
+      const updatedSite = await prisma.site.update({
+        where: { id: siteId },
+        data: {
+          currentStage,
+          updated_by: userId,
+          updated_at: new Date(),
+        },
+        select: {
+          id: true,
+          currentStage: true,
+          name: true,
+        },
+      });
+
+      // Fire-and-forget notifications — do not block the response.
+      if (existingSite.currentStage !== updatedSite.currentStage) {
+        Promise.resolve()
+          .then(async () => {
+            const actingUser = await prisma.user.findUnique({
+              where: { id: userId },
+              select: { id: true, name: true, role: true },
+            });
+            if (!actingUser?.id) return;
+
+            const relatedUserIds =
+              await pushNotificationService.getSiteRelatedRecipientIds(
+                updatedSite.id,
+                actingUser.id
+              );
+            const recipients = uniqueUserIds([...relatedUserIds, actingUser.id]);
+            if (!recipients.length) return;
+
+            await pushNotificationService.dispatchNotifications({
+              event: "SITE_UPDATED",
+              senderId: actingUser.id,
+              recipientIds: recipients,
+              title: `${updatedSite.name}`,
+              body: `${actingUser.name} (${String(actingUser?.role || "").replace(
+                /_/g,
+                " "
+              )}) changed current stage to ${updatedSite.currentStage}.`,
+              type: "SiteActivity",
+              data: {
+                siteId: updatedSite.id,
+                action: "current_stage_updated",
+                siteName: updatedSite.name,
+                currentStage: updatedSite.currentStage,
+              },
+            });
+          })
+          .catch((err) => {
+            console.error(
+              `[Sites.updateCurrentStage] notification failed for site ${siteId}:`,
+              err?.message || err
+            );
+          });
+      }
+
+      return this.sendResponse(req, res, {
+        message: "Current stage updated successfully",
+        status: 200,
+        data: {
+          id: updatedSite.id,
+          currentStage: updatedSite.currentStage,
+        },
+      });
+    } catch (error) {
+      return this.sendResponse(req, res, {
+        message: "Failed to update current stage",
+        status: 500,
+        error: error.message,
+      });
+    }
+  };
+
   delete = async (req, res) => {
     try {
       const siteId = Number(req.params.id);

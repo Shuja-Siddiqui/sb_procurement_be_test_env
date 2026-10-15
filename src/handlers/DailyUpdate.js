@@ -8,6 +8,8 @@ const toNumber = (value) => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
+const normalizeProductId = (value) => String(value ?? "").trim();
+
 const normalizeDateOnly = (input) => {
   const date = input ? new Date(input) : new Date();
   if (Number.isNaN(date.getTime())) return null;
@@ -51,6 +53,21 @@ const pushNotificationService = new PushNotificationService();
 class DailyUpdate extends Response {
   hasDailyUpdateAccess = (role) => ALLOWED_DAILY_UPDATE_ROLES.has(normalizeRole(role));
 
+  /**
+   * Latest saved daily update strictly before the selected date.
+   * (Not only date-1 — so remaining carries across skipped days.)
+   */
+  getLatestPreviousUpdate = async (siteId, date) => {
+    if (!Number.isFinite(siteId) || !date) return null;
+    return prisma.dailyMaterialUpdate.findFirst({
+      where: {
+        siteId,
+        date: { lt: date },
+      },
+      orderBy: { date: "desc" },
+    });
+  };
+
   getTemplateRows = async (siteId) => {
     const totalMaterial = await prisma.materialTotal.findUnique({
       where: { siteId },
@@ -81,12 +98,18 @@ class DailyUpdate extends Response {
   };
 
   mergeRows = (templateRows, payloadRows, previousRows = []) => {
-    const previousMap = new Map((previousRows || []).map((row) => [row.productId, row]));
-    const payloadMap = new Map((payloadRows || []).map((row) => [row.productId, row]));
+    const previousMap = new Map(
+      (previousRows || []).map((row) => [normalizeProductId(row.productId), row]),
+    );
+    const payloadMap = new Map(
+      (payloadRows || []).map((row) => [normalizeProductId(row.productId), row]),
+    );
 
     return templateRows.map((templateRow) => {
-      const previous = previousMap.get(templateRow.productId);
-      const payload = payloadMap.get(templateRow.productId) || {};
+      const productKey = normalizeProductId(templateRow.productId);
+      const previous = previousMap.get(productKey);
+      const payload = payloadMap.get(productKey) || {};
+      const hasPayloadClosing = payload.closing_qty !== undefined && payload.closing_qty !== null && payload.closing_qty !== "";
 
       const resolvedSystemSiteQty = payload.system_site_qty !== undefined
         ? toNumber(payload.system_site_qty)
@@ -97,11 +120,15 @@ class DailyUpdate extends Response {
         ? toNumber(payload.received_qty)
         : toNumber(templateRow.received_qty ?? resolvedSystemSiteQty);
       const damaged = toNumber(payload.damaged_qty);
-      const closing = payload.closing_qty !== undefined
+      // New day / draft: auto-fill Remaining on site from last saved remaining.
+      // Explicit payload closing wins when the user is saving edits.
+      let closing = hasPayloadClosing
         ? toNumber(payload.closing_qty)
         : previous
-          ? toNumber(previous.closing_qty)
+          ? previousRemainingQty
           : 0;
+      if (closing > received) closing = received;
+      if (closing < 0) closing = 0;
       const consumed = received - closing;
 
       return {
@@ -154,11 +181,7 @@ class DailyUpdate extends Response {
         });
       }
 
-      const previousDay = new Date(date);
-      previousDay.setUTCDate(previousDay.getUTCDate() - 1);
-      const previousUpdate = await prisma.dailyMaterialUpdate.findUnique({
-        where: { siteId_date: { siteId, date: previousDay } },
-      });
+      const previousUpdate = await this.getLatestPreviousUpdate(siteId, date);
 
       const templateRows = await this.getTemplateRows(siteId);
       const mergedRows = this.mergeRows(templateRows, rows, previousUpdate?.rows);
@@ -235,18 +258,35 @@ class DailyUpdate extends Response {
         where: { siteId_date: { siteId, date } },
       });
 
+      const previousUpdate = await this.getLatestPreviousUpdate(siteId, date);
+      const previousRows = Array.isArray(previousUpdate?.rows) ? previousUpdate.rows : [];
+      const previousMap = new Map(
+        previousRows.map((row) => [normalizeProductId(row.productId), row]),
+      );
+
       if (current) {
         // Always reflect latest Total Material values in "Received" when viewing
-        // an existing daily update record.
+        // an existing daily update record, and refresh previous remaining from
+        // the latest prior daily update (so skipped days still show correctly).
         const templateRows = await this.getTemplateRows(siteId);
         const templateMap = new Map(
-          templateRows.map((row) => [row.productId, row]),
+          templateRows.map((row) => [normalizeProductId(row.productId), row]),
         );
         const refreshedRows = (Array.isArray(current?.rows) ? current.rows : []).map(
           (row) => {
-            const productId = row?.productId;
-            const templateRow = templateMap.get(productId);
-            if (!templateRow) return row;
+            const productKey = normalizeProductId(row?.productId);
+            const templateRow = templateMap.get(productKey);
+            const previous = previousMap.get(productKey);
+            const previousRemainingQty = previous ? toNumber(previous.closing_qty) : 0;
+            const previousUsedQty = previous ? toNumber(previous.site_used_qty) : 0;
+            if (!templateRow) {
+              return {
+                ...row,
+                prev_remaining_qty: parseFloat(previousRemainingQty.toFixed(6)),
+                prev_site_used_qty: parseFloat(previousUsedQty.toFixed(6)),
+                opening_qty: parseFloat(previousRemainingQty.toFixed(6)),
+              };
+            }
             const latestReceived = toNumber(templateRow.received_qty);
             const nextClosing = Math.min(
               toNumber(row?.closing_qty),
@@ -258,6 +298,9 @@ class DailyUpdate extends Response {
               received_qty: parseFloat(latestReceived.toFixed(6)),
               closing_qty: parseFloat(nextClosing.toFixed(6)),
               site_used_qty: parseFloat((latestReceived - nextClosing).toFixed(6)),
+              prev_remaining_qty: parseFloat(previousRemainingQty.toFixed(6)),
+              prev_site_used_qty: parseFloat(previousUsedQty.toFixed(6)),
+              opening_qty: parseFloat(previousRemainingQty.toFixed(6)),
             };
           },
         );
@@ -271,14 +314,8 @@ class DailyUpdate extends Response {
         });
       }
 
-      const previousDay = new Date(date);
-      previousDay.setUTCDate(previousDay.getUTCDate() - 1);
-      const previousUpdate = await prisma.dailyMaterialUpdate.findUnique({
-        where: { siteId_date: { siteId, date: previousDay } },
-      });
-
       const templateRows = await this.getTemplateRows(siteId);
-      const draftRows = this.mergeRows(templateRows, [], previousUpdate?.rows);
+      const draftRows = this.mergeRows(templateRows, [], previousRows);
 
       return this.sendResponse(req, res, {
         message: "Daily update template fetched successfully",
