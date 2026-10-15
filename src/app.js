@@ -80,7 +80,7 @@ app.use("/api/v1", routes);
 // Only start the HTTP server when running locally.
 // On platforms like Vercel (serverless), we just export the Express app
 // and let the platform handle the HTTP server.
-if (env === "local") {
+if (env === "production" || env === "local") {
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT} in ${env} mode`);
   });

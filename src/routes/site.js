@@ -9,6 +9,7 @@ router.get("/assignees", authenticateJWT, handler.getAssignableUsers);
 router.post("/", authenticateJWT, handler.create);
 router.get("/", authenticateJWT, handler.getAll);
 router.get("/:id", authenticateJWT, handler.getById);
+router.patch("/:id/current-stage", authenticateJWT, handler.updateCurrentStage);
 router.put("/:id", authenticateJWT, handler.update);
 router.delete("/:id", authenticateJWT, handler.delete);
 
