@@ -2,6 +2,7 @@ const { Prisma, RequestStatus, StageName } = require("@prisma/client");
 const sharp = require("sharp");
 const prisma = require("../lib/prisma");
 const { canUserAccessSite } = require("../lib/siteAccess");
+const { getApiBaseUrl } = require("../lib/requestUrl");
 const Response = require("./Response");
 
 const toFloat = (v) => {
@@ -452,7 +453,7 @@ class Requests extends Response {
           data: webpBuffer,
         },
       });
-      const baseUrl = `${req.protocol}://${req.get("host")}/api/v1`;
+      const baseUrl = getApiBaseUrl(req);
       const fileUrl = `${baseUrl}/request/sanitary-image/${imageRow.id}`;
       return this.sendResponse(req, res, {
         status: 201,

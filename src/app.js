@@ -21,6 +21,9 @@ const server = http.createServer(app); // ✅ create server using http
 
 const PORT = process.env.PORT || 5000;
 
+// Vercel / reverse proxies: honor X-Forwarded-Proto so req.protocol is https
+app.set("trust proxy", 1);
+
 // Middlewares
 app.use(cors());
 // JSON / multipart: no practical cap unless JSON_BODY_LIMIT is set (e.g. "50mb" for production)
