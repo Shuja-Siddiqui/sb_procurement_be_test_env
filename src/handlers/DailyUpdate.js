@@ -2,6 +2,7 @@ const Response = require("./Response");
 const prisma = require("../lib/prisma");
 const { Role } = require("@prisma/client");
 const PushNotificationService = require("./PushNotificationService");
+const { getApiBaseUrl } = require("../lib/requestUrl");
 
 const toNumber = (value) => {
   const parsed = parseFloat(value);
@@ -926,7 +927,7 @@ class DailyUpdate extends Response {
   };
 
   buildPhotoUrl = (req, photoId) => {
-    const baseUrl = `${req.protocol}://${req.get("host")}/api/v1`;
+    const baseUrl = getApiBaseUrl(req);
     return `${baseUrl}/dailyUpdate/photos/file/${photoId}`;
   };
 

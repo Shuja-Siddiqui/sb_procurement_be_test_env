@@ -1,6 +1,7 @@
 const { MessageType } = require("@prisma/client");
 const prisma = require("../lib/prisma");
 const Response = require("./Response");
+const { getRequestProtocol } = require("../lib/requestUrl");
 // Socket.IO disabled — chat realtime via Supabase postgres_changes on "Message".
 // const { getSocket } = require("../socket");
 
@@ -325,7 +326,7 @@ class Chat extends Response {
 
 
       const buildUrl = (id) =>
-        `${req.protocol}://${req.get("host")}/message/${id}/file`;
+        `${getRequestProtocol(req)}://${req.get("host")}/message/${id}/file`;
 
       const formatItem = (msg) => ({
         id: msg.id,
