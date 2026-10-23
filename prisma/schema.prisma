@@ -65,6 +65,7 @@ model Site {
   contractorData       ContractorData?
   dailyIssues          DailyIssueUpdate[]
   dailyUpdates         DailyMaterialUpdate[]
+  dailyUpdatePhotos    DailyUpdatePhoto[]
   dailySiteProgress    DailySiteProgressUpdate[]
   extraMaterial        ExtraMaterial[]
   materialTotal        MaterialTotal?
@@ -92,6 +93,25 @@ model DailyMaterialUpdate {
 
   @@unique([siteId, date])
   @@index([siteId, date])
+}
+
+model DailyUpdatePhoto {
+  id             Int      @id @default(autoincrement())
+  siteId         Int
+  date           DateTime
+  category       String   @default("site_progress")
+  caption        String?
+  fileName       String
+  mimeType       String   @default("image/webp")
+  size           Int      @default(0)
+  data           Bytes
+  uploadedBy     Int?
+  uploadedByName String?
+  createdAt      DateTime @default(now())
+  site           Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
+
+  @@index([siteId, date])
+  @@index([siteId, date, category])
 }
 
 model DailyIssueUpdate {

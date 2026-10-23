@@ -11,10 +11,20 @@ const toNumber = (value) => {
 const normalizeProductId = (value) => String(value ?? "").trim();
 
 const normalizeDateOnly = (input) => {
-  const date = input ? new Date(input) : new Date();
+  if (!input) return getTodayUtcDateOnly();
+  const raw = String(input).trim();
+  // Prefer YYYY-MM-DD so local timezone never shifts the calendar day
+  const ymd = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
+  if (ymd) {
+    return new Date(
+      Date.UTC(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3])),
+    );
+  }
+  const date = new Date(input);
   if (Number.isNaN(date.getTime())) return null;
-  const normalized = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
-  return normalized;
+  return new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
+  );
 };
 
 const getTodayUtcDateOnly = () => {
@@ -911,6 +921,504 @@ class DailyUpdate extends Response {
       return this.sendResponse(req, res, {
         message: "Failed to fetch all daily site progress history",
         status: 500,
+      });
+    }
+  };
+
+  buildPhotoUrl = (req, photoId) => {
+    const baseUrl = `${req.protocol}://${req.get("host")}/api/v1`;
+    return `${baseUrl}/dailyUpdate/photos/file/${photoId}`;
+  };
+
+  mapPhotoRow = (req, row) => ({
+    id: row.id,
+    siteId: row.siteId,
+    siteName: row.site?.name || null,
+    date: row.date,
+    category: row.category,
+    caption: row.caption || "",
+    fileName: row.fileName,
+    mimeType: row.mimeType,
+    size: row.size,
+    uploadedBy: row.uploadedBy,
+    uploadedByName: row.uploadedByName,
+    createdAt: row.createdAt,
+    url: this.buildPhotoUrl(req, row.id),
+  });
+
+  uploadPhotos = async (req, res) => {
+    try {
+      if (!this.hasDailyUpdateAccess(req?.user?.role)) {
+        return this.sendResponse(req, res, {
+          status: 403,
+          message:
+            "Only admin, supervisor, super admin, site engineer, and director can upload daily update photos",
+        });
+      }
+
+      const siteId = Number(req.body?.siteId);
+      const date = normalizeDateOnly(req.body?.date);
+      const category = String(req.body?.category || "site_progress")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "_");
+      const caption = String(req.body?.caption || "").trim();
+
+      if (!Number.isFinite(siteId) || siteId <= 0) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Valid siteId is required",
+        });
+      }
+      if (!date) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Valid date is required",
+        });
+      }
+      if (date > getTodayUtcDateOnly()) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Future date is not allowed",
+        });
+      }
+
+      const site = await prisma.site.findUnique({ where: { id: siteId } });
+      if (!site) {
+        return this.sendResponse(req, res, {
+          status: 404,
+          message: "Site not found",
+        });
+      }
+
+      const incoming = req?.files?.photos || req?.files?.photo || req?.files?.files;
+      const fileList = !incoming
+        ? []
+        : Array.isArray(incoming)
+          ? incoming
+          : [incoming];
+
+      if (fileList.length === 0) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "At least one photo/file is required",
+        });
+      }
+
+      const allowedCategories = new Set([
+        "delivery_slip",
+        "damage_report",
+        "site_progress",
+        "quality_check",
+        "other",
+      ]);
+      const normalizedCategory = allowedCategories.has(category)
+        ? category
+        : "site_progress";
+
+      const MAX_ORIGINAL_BYTES = 5 * 1024 * 1024; // 5MB
+      const MAX_COMPRESSED_IMAGE_BYTES = 200 * 1024; // 200KB
+      const created = [];
+      const rejected = [];
+
+      for (const file of fileList) {
+        const mimeType = String(file?.mimetype || "application/octet-stream").toLowerCase();
+        const isImage = mimeType.startsWith("image/");
+        const isPdf = mimeType === "application/pdf";
+        if (!isImage && !isPdf) {
+          continue;
+        }
+
+        const buffer = Buffer.isBuffer(file?.data) ? file.data : Buffer.from(file?.data || []);
+        if (!buffer.length) continue;
+
+        const originalName = String(file?.name || "daily-update-file")
+          .replace(/[^\w.\-]+/g, "_")
+          .slice(0, 120);
+
+        if (buffer.length > MAX_ORIGINAL_BYTES) {
+          rejected.push(`${originalName} exceeds 5MB`);
+          continue;
+        }
+
+        if (isImage && buffer.length > MAX_COMPRESSED_IMAGE_BYTES) {
+          rejected.push(
+            `${originalName} must be compressed to 200KB or less before upload`,
+          );
+          continue;
+        }
+
+        const baseName = originalName.replace(/\.[^/.]+$/, "") || "daily-update-file";
+        const fileName = isImage ? `${baseName}.webp` : originalName;
+        const storedMime = isImage ? "image/webp" : mimeType;
+
+        const row = await prisma.dailyUpdatePhoto.create({
+          data: {
+            siteId,
+            date,
+            category: normalizedCategory,
+            caption: caption || null,
+            fileName,
+            mimeType: storedMime,
+            size: Number(buffer.length || 0),
+            data: buffer,
+            uploadedBy: req.user?.id || null,
+            uploadedByName: req.user?.name || null,
+          },
+        });
+        created.push(this.mapPhotoRow(req, row));
+      }
+
+      if (created.length === 0) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message:
+            rejected[0] ||
+            "No valid image/PDF files were uploaded (images max 5MB original, 200KB compressed)",
+        });
+      }
+
+      return this.sendResponse(req, res, {
+        status: 201,
+        message: "Photos uploaded successfully",
+        data: created,
+      });
+    } catch (error) {
+      console.error("Error in upload daily update photos:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to upload photos",
+        error: error.message,
+      });
+    }
+  };
+
+  getPhotosGallery = async (req, res) => {
+    try {
+      if (!this.hasDailyUpdateAccess(req?.user?.role)) {
+        return this.sendResponse(req, res, {
+          status: 403,
+          message:
+            "Only admin, supervisor, super admin, site engineer, and director can access daily update photos",
+        });
+      }
+
+      const rawLimit = Number(req.query?.limit);
+      const limit =
+        Number.isFinite(rawLimit) && rawLimit > 0
+          ? Math.min(Math.floor(rawLimit), 100)
+          : 48;
+
+      const rows = await prisma.dailyUpdatePhoto.findMany({
+        where: {
+          mimeType: { startsWith: "image/" },
+        },
+        orderBy: { createdAt: "desc" },
+        take: limit,
+        select: {
+          id: true,
+          siteId: true,
+          date: true,
+          category: true,
+          caption: true,
+          fileName: true,
+          mimeType: true,
+          size: true,
+          uploadedBy: true,
+          uploadedByName: true,
+          createdAt: true,
+          site: { select: { name: true } },
+        },
+      });
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Gallery photos fetched successfully",
+        data: rows.map((row) => this.mapPhotoRow(req, row)),
+      });
+    } catch (error) {
+      console.error("Error in get gallery photos:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to fetch gallery photos",
+      });
+    }
+  };
+
+  getPhotosBySite = async (req, res) => {
+    try {
+      if (!this.hasDailyUpdateAccess(req?.user?.role)) {
+        return this.sendResponse(req, res, {
+          status: 403,
+          message:
+            "Only admin, supervisor, super admin, site engineer, and director can access daily update photos",
+        });
+      }
+
+      const siteId = Number(req.params.siteId);
+      const rawLimit = Number(req.query?.limit);
+      const limit =
+        Number.isFinite(rawLimit) && rawLimit > 0
+          ? Math.min(Math.floor(rawLimit), 100)
+          : 48;
+
+      if (!Number.isFinite(siteId) || siteId <= 0) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Valid siteId is required",
+        });
+      }
+
+      const rows = await prisma.dailyUpdatePhoto.findMany({
+        where: { siteId },
+        orderBy: { createdAt: "desc" },
+        take: limit,
+        select: {
+          id: true,
+          siteId: true,
+          date: true,
+          category: true,
+          caption: true,
+          fileName: true,
+          mimeType: true,
+          size: true,
+          uploadedBy: true,
+          uploadedByName: true,
+          createdAt: true,
+          site: { select: { name: true } },
+        },
+      });
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Site gallery photos fetched successfully",
+        data: rows.map((row) => this.mapPhotoRow(req, row)),
+      });
+    } catch (error) {
+      console.error("Error in get photos by site:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to fetch site photos",
+      });
+    }
+  };
+
+  getPhotosBySiteDate = async (req, res) => {
+    try {
+      if (!this.hasDailyUpdateAccess(req?.user?.role)) {
+        return this.sendResponse(req, res, {
+          status: 403,
+          message:
+            "Only admin, supervisor, super admin, site engineer, and director can access daily update photos",
+        });
+      }
+
+      const siteId = Number(req.params.siteId);
+      // Only filter by date when the client explicitly sends one.
+      // Do NOT default missing date to "today" (that broke the gallery).
+      const hasDateQuery =
+        req.query?.date !== undefined &&
+        req.query?.date !== null &&
+        String(req.query.date).trim() !== "";
+      const date = hasDateQuery ? normalizeDateOnly(req.query.date) : null;
+      const rawLimit = Number(req.query?.limit);
+      const limit =
+        Number.isFinite(rawLimit) && rawLimit > 0
+          ? Math.min(Math.floor(rawLimit), 100)
+          : date
+            ? undefined
+            : 24;
+
+      if (!Number.isFinite(siteId) || siteId <= 0) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Valid siteId is required",
+        });
+      }
+      if (hasDateQuery && !date) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Valid date is required",
+        });
+      }
+
+      const rows = await prisma.dailyUpdatePhoto.findMany({
+        where: {
+          siteId,
+          ...(date ? { date } : {}),
+        },
+        orderBy: { createdAt: "desc" },
+        ...(limit ? { take: limit } : {}),
+        select: {
+          id: true,
+          siteId: true,
+          date: true,
+          category: true,
+          caption: true,
+          fileName: true,
+          mimeType: true,
+          size: true,
+          uploadedBy: true,
+          uploadedByName: true,
+          createdAt: true,
+        },
+      });
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Daily update photos fetched successfully",
+        data: rows.map((row) => this.mapPhotoRow(req, row)),
+      });
+    } catch (error) {
+      console.error("Error in get daily update photos:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to fetch photos",
+      });
+    }
+  };
+
+  getPhotoFile = async (req, res) => {
+    try {
+      if (!this.hasDailyUpdateAccess(req?.user?.role)) {
+        return this.sendResponse(req, res, {
+          status: 403,
+          message: "Access denied",
+        });
+      }
+
+      const photoId = Number(req.params.id);
+      if (!Number.isFinite(photoId) || photoId <= 0) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Invalid photo id",
+        });
+      }
+
+      const row = await prisma.dailyUpdatePhoto.findUnique({
+        where: { id: photoId },
+      });
+      if (!row?.data) {
+        return this.sendResponse(req, res, {
+          status: 404,
+          message: "Photo not found",
+        });
+      }
+
+      res.setHeader("Content-Type", row.mimeType || "image/webp");
+      res.setHeader(
+        "Content-Disposition",
+        `inline; filename="${String(row.fileName || "photo").replace(/"/g, "")}"`,
+      );
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      return res.send(Buffer.from(row.data));
+    } catch (error) {
+      console.error("Error in get daily update photo file:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to retrieve photo",
+      });
+    }
+  };
+
+  updatePhotoCaption = async (req, res) => {
+    try {
+      if (!this.hasDailyUpdateAccess(req?.user?.role)) {
+        return this.sendResponse(req, res, {
+          status: 403,
+          message: "Access denied",
+        });
+      }
+
+      const photoId = Number(req.params.id);
+      if (!Number.isFinite(photoId) || photoId <= 0) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Invalid photo id",
+        });
+      }
+
+      const caption = String(req.body?.caption ?? req.body?.note ?? "").trim();
+      const existing = await prisma.dailyUpdatePhoto.findUnique({
+        where: { id: photoId },
+        select: {
+          id: true,
+          siteId: true,
+          date: true,
+          category: true,
+          fileName: true,
+          mimeType: true,
+          size: true,
+          uploadedBy: true,
+          uploadedByName: true,
+          createdAt: true,
+        },
+      });
+      if (!existing) {
+        return this.sendResponse(req, res, {
+          status: 404,
+          message: "Photo not found",
+        });
+      }
+
+      const updated = await prisma.dailyUpdatePhoto.update({
+        where: { id: photoId },
+        data: { caption: caption || null },
+      });
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Note updated successfully",
+        data: this.mapPhotoRow(req, updated),
+      });
+    } catch (error) {
+      console.error("Error in update daily update photo caption:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to update note",
+      });
+    }
+  };
+
+  deletePhoto = async (req, res) => {
+    try {
+      if (!this.hasDailyUpdateAccess(req?.user?.role)) {
+        return this.sendResponse(req, res, {
+          status: 403,
+          message: "Access denied",
+        });
+      }
+
+      const photoId = Number(req.params.id);
+      if (!Number.isFinite(photoId) || photoId <= 0) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Invalid photo id",
+        });
+      }
+
+      const existing = await prisma.dailyUpdatePhoto.findUnique({
+        where: { id: photoId },
+        select: { id: true },
+      });
+      if (!existing) {
+        return this.sendResponse(req, res, {
+          status: 404,
+          message: "Photo not found",
+        });
+      }
+
+      await prisma.dailyUpdatePhoto.delete({ where: { id: photoId } });
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Photo deleted successfully",
+        data: { id: photoId },
+      });
+    } catch (error) {
+      console.error("Error in delete daily update photo:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to delete photo",
       });
     }
   };
