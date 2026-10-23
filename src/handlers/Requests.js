@@ -1,4 +1,4 @@
-const { RequestStatus, StageName } = require("@prisma/client");
+const { Prisma, RequestStatus, StageName } = require("@prisma/client");
 const sharp = require("sharp");
 const prisma = require("../lib/prisma");
 const { canUserAccessSite } = require("../lib/siteAccess");
@@ -1056,27 +1056,159 @@ class Requests extends Response {
 
   getRequestsByStageNameFromBody = async (req, res) => {
     try {
-      const stageName = normalizeStageName(req.body.stageName);
-      const siteId = req.body.siteId ? Number(req.body.siteId) : null;
+      const body = req.body || {};
+      const stageName = normalizeStageName(body.stageName);
+      const siteId = body.siteId ? Number(body.siteId) : null;
       if (siteId && !(await this.ensureSiteAccess(req, res, siteId))) return;
+
+      const pageParam = body.page ?? req.query?.page;
+      const limitParam = body.limit ?? req.query?.limit;
+      const usePagination = pageParam != null || limitParam != null;
+
+      const statusFilterRaw = String(body.status || "").trim();
+      const statusFilter = statusFilterRaw
+        ? normalizeStatus(statusFilterRaw)
+        : null;
+      const priorityFilter = String(body.priority || "")
+        .trim()
+        .toLowerCase();
+      const search = String(body.search || "").trim();
+      const constructionStage = String(
+        body.stageFilter || body.constructionStage || "",
+      ).trim();
+
       const where = { ...(siteId ? { siteId } : {}) };
 
-      // If stageName matches enum, filter by stage.
-      // If custom stage name is sent from frontend, fallback to site-level list
-      // so request listing does not disappear.
+      // If stageName matches enum, filter by workflow stage.
+      // Custom construction stage names are handled via stageFilter below.
       if (stageName) {
-        where.OR = [
-          { stages: { some: { stageName } } },
-          { stageName },
+        where.OR = [{ stages: { some: { stageName } } }, { stageName }];
+      }
+
+      if (
+        priorityFilter &&
+        VALID_PRIORITIES.includes(priorityFilter)
+      ) {
+        where.priority = priorityFilter;
+      }
+
+      if (constructionStage) {
+        where.AND = [
+          ...(Array.isArray(where.AND) ? where.AND : []),
+          {
+            stageWiseQty: {
+              path: [constructionStage],
+              not: Prisma.JsonNull,
+            },
+          },
         ];
       }
 
-      const requests = await prisma.request.findMany({
-        where,
-        include: { site: true, stages: { include: { user: { select: { id: true, name: true, role: true } } } }, product: true },
+      if (search) {
+        const searchNum = Number(search);
+        const searchOr = [
+          { product: { name: { contains: search, mode: "insensitive" } } },
+          { site: { name: { contains: search, mode: "insensitive" } } },
+        ];
+        if (Number.isFinite(searchNum) && searchNum > 0) {
+          searchOr.push({ siteRequestId: searchNum });
+          searchOr.push({ id: searchNum });
+        }
+        where.AND = [
+          ...(Array.isArray(where.AND) ? where.AND : []),
+          { OR: searchOr },
+        ];
+      }
+
+      const listInclude = {
+        site: { select: { id: true, name: true, status: true } },
+        product: { select: { id: true, name: true, unit: true } },
+        stages: {
+          include: {
+            user: { select: { id: true, name: true, role: true } },
+          },
+        },
+      };
+
+      // Backward compatible: callers without page/limit still get a full array.
+      if (!usePagination) {
+        const requests = await prisma.request.findMany({
+          where: statusFilter ? { ...where, status: statusFilter } : where,
+          include: listInclude,
+          orderBy: { createdAt: "desc" },
+        });
+        return this.sendResponse(req, res, {
+          status: 200,
+          data: requests.map(serializeRequest),
+        });
+      }
+
+      const page = Math.max(1, parseInt(pageParam, 10) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(limitParam, 10) || 10));
+
+      const listWhere = statusFilter
+        ? { ...where, status: statusFilter }
+        : where;
+      // Tab counts ignore status filter so each status pill total stays correct.
+      const tabCountWhere = { ...where };
+
+      const [total, statusGroups] = await Promise.all([
+        prisma.request.count({ where: listWhere }),
+        prisma.request.groupBy({
+          by: ["status"],
+          where: tabCountWhere,
+          _count: { _all: true },
+        }),
+      ]);
+
+      const totalPages = Math.max(1, Math.ceil(total / limit) || 1);
+      const safePage = Math.min(page, totalPages);
+      const skip = (safePage - 1) * limit;
+
+      const pageRows = await prisma.request.findMany({
+        where: listWhere,
+        include: listInclude,
         orderBy: { createdAt: "desc" },
+        skip,
+        take: limit,
       });
-      return this.sendResponse(req, res, { status: 200, data: requests.map(serializeRequest) });
+
+      const statusCounts = {
+        all: 0,
+        pending: 0,
+        in_progress: 0,
+        approved: 0,
+        rejected: 0,
+        completed: 0,
+        conflict: 0,
+      };
+      statusGroups.forEach((row) => {
+        const key = String(row.status || "")
+          .toLowerCase()
+          .replace(/\s+/g, "_");
+        const count = row?._count?._all || 0;
+        statusCounts.all += count;
+        if (Object.prototype.hasOwnProperty.call(statusCounts, key)) {
+          statusCounts[key] = count;
+        }
+      });
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Requests fetched successfully",
+        data: {
+          items: pageRows.map(serializeRequest),
+          pagination: {
+            page: safePage,
+            limit,
+            total,
+            totalPages,
+            from: total === 0 ? 0 : skip + 1,
+            to: Math.min(skip + pageRows.length, total),
+          },
+          statusCounts,
+        },
+      });
     } catch (error) {
       return this.sendResponse(req, res, {
         status: 500,
