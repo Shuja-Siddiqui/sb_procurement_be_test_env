@@ -101,6 +101,7 @@ model DailyUpdatePhoto {
   date           DateTime
   category       String   @default("site_progress")
   caption        String?
+  issueId        String?
   fileName       String
   mimeType       String   @default("image/webp")
   size           Int      @default(0)
@@ -112,6 +113,7 @@ model DailyUpdatePhoto {
 
   @@index([siteId, date])
   @@index([siteId, date, category])
+  @@index([issueId])
 }
 
 model DailyIssueUpdate {
