@@ -452,11 +452,23 @@ class DailyUpdate extends Response {
         const createdBy = existingRow?.createdBy ?? actorId;
         const createdByName = existingRow?.createdByName ?? actorName;
         const createdAt = existingRow?.createdAt ?? new Date().toISOString();
+        const incomingPhotoIds = Array.isArray(row?.photoIds)
+          ? row.photoIds
+              .map((id) => Number(id))
+              .filter((id) => Number.isFinite(id) && id > 0)
+          : null;
+        const previousPhotoIds = Array.isArray(existingRow?.photoIds)
+          ? existingRow.photoIds
+              .map((id) => Number(id))
+              .filter((id) => Number.isFinite(id) && id > 0)
+          : [];
+        const photoIds = [...new Set(incomingPhotoIds ?? previousPhotoIds)];
         return {
           issueId,
           issueType: String(row?.issueType || "").trim(),
           explanation: String(row?.explanation || "").trim(),
           status: String(row?.status || "open").toLowerCase(),
+          photoIds,
           createdBy,
           createdByName,
           createdAt,
@@ -938,6 +950,7 @@ class DailyUpdate extends Response {
     date: row.date,
     category: row.category,
     caption: row.caption || "",
+    issueId: row.issueId || null,
     fileName: row.fileName,
     mimeType: row.mimeType,
     size: row.size,
@@ -964,6 +977,7 @@ class DailyUpdate extends Response {
         .toLowerCase()
         .replace(/\s+/g, "_");
       const caption = String(req.body?.caption || "").trim();
+      const issueId = String(req.body?.issueId || "").trim() || null;
 
       if (!Number.isFinite(siteId) || siteId <= 0) {
         return this.sendResponse(req, res, {
@@ -1010,7 +1024,6 @@ class DailyUpdate extends Response {
         "delivery_slip",
         "damage_report",
         "site_progress",
-        "quality_check",
         "other",
       ]);
       const normalizedCategory = allowedCategories.has(category)
@@ -1059,6 +1072,7 @@ class DailyUpdate extends Response {
             date,
             category: normalizedCategory,
             caption: caption || null,
+            issueId,
             fileName,
             mimeType: storedMime,
             size: Number(buffer.length || 0),
@@ -1122,6 +1136,7 @@ class DailyUpdate extends Response {
           date: true,
           category: true,
           caption: true,
+          issueId: true,
           fileName: true,
           mimeType: true,
           size: true,
@@ -1180,6 +1195,7 @@ class DailyUpdate extends Response {
           date: true,
           category: true,
           caption: true,
+          issueId: true,
           fileName: true,
           mimeType: true,
           size: true,
@@ -1256,6 +1272,7 @@ class DailyUpdate extends Response {
           date: true,
           category: true,
           caption: true,
+          issueId: true,
           fileName: true,
           mimeType: true,
           size: true,
