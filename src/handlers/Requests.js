@@ -261,6 +261,20 @@ const findCompletedStageInRequest = (stageMaterial, stageWiseQty) => {
   return null;
 };
 
+/**
+ * Only fully finished requests count toward Delivered QTY / used stock.
+ * QA or Account approval alone must NOT insert into delivered qty.
+ */
+const isRequestQtyCommitted = (request) => {
+  const status = String(request?.status || "").toUpperCase();
+  if (status === RequestStatus.REJECTED) return false;
+  return (
+    status === RequestStatus.APPROVED ||
+    status === RequestStatus.CONFLICT ||
+    status === RequestStatus.COMPLETED
+  );
+};
+
 const recalculateSiteStageUsage = async (siteId) => {
   const site = await prisma.site.findUnique({
     where: { id: siteId },
@@ -274,10 +288,17 @@ const recalculateSiteStageUsage = async (siteId) => {
   const stageData = JSON.parse(JSON.stringify(stageMaterial.data || {}));
   const materialStageKeys = Object.keys(stageData);
 
-  const finalizedRequests = await prisma.request.findMany({
+  // Delivered QTY only from fully approved/received requests — not QA/Account alone.
+  const candidateRequests = await prisma.request.findMany({
     where: {
       siteId,
-      status: { in: [RequestStatus.APPROVED, RequestStatus.CONFLICT] },
+      status: {
+        in: [
+          RequestStatus.APPROVED,
+          RequestStatus.CONFLICT,
+          RequestStatus.COMPLETED,
+        ],
+      },
     },
     select: {
       productId: true,
@@ -286,8 +307,10 @@ const recalculateSiteStageUsage = async (siteId) => {
       receivedQty: true,
       stageName: true,
       stageWiseQty: true,
+      status: true,
     },
   });
+  const finalizedRequests = candidateRequests.filter(isRequestQtyCommitted);
 
   const approvedByStageProduct = new Map();
   finalizedRequests.forEach((req) => {
@@ -990,18 +1013,19 @@ class Requests extends Response {
       );
 
       const serialized = serializeRequest(updatedRequest);
-      this.sendResponse(req, res, {
-        status: 200,
-        message: "Request updated",
-        data: serialized,
-      });
-      // Recalculate stage/material totals in background so request approval
-      // response is not blocked by heavy aggregation work.
-      recalculateSiteStageUsage(updatedRequest.siteId).catch((recalcError) => {
+      // Await usage recalc so remaining material is current before clients refresh.
+      try {
+        await recalculateSiteStageUsage(updatedRequest.siteId);
+      } catch (recalcError) {
         console.error(
           `[Request.updateRequest] recalculateSiteStageUsage failed for site ${updatedRequest.siteId}:`,
           recalcError
         );
+      }
+      this.sendResponse(req, res, {
+        status: 200,
+        message: "Request updated",
+        data: serialized,
       });
       return;
     } catch (error) {
@@ -1214,6 +1238,47 @@ class Requests extends Response {
       return this.sendResponse(req, res, {
         status: 500,
         message: "Error fetching requests",
+        error: error.message,
+      });
+    }
+  };
+  /**
+   * Heal Delivered/Remaining for a site (fixes old QA/Account false commits).
+   * POST /requests/site/:siteId/recalculate-usage
+   */
+  recalculateSiteUsage = async (req, res) => {
+    try {
+      const siteId = Number(req.params.siteId);
+      if (!Number.isFinite(siteId) || siteId <= 0) {
+        return this.sendResponse(req, res, {
+          status: 400,
+          message: "Valid siteId is required",
+        });
+      }
+      if (!(await this.ensureSiteAccess(req, res, siteId))) return;
+
+      await recalculateSiteStageUsage(siteId);
+
+      const stageMaterial = await prisma.stageMaterial.findUnique({
+        where: { siteId },
+      });
+      const materialTotal = await prisma.materialTotal.findUnique({
+        where: { siteId },
+      });
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        message: "Site material usage recalculated",
+        data: {
+          stageMaterial,
+          materialTotal,
+        },
+      });
+    } catch (error) {
+      console.error("recalculateSiteUsage failed:", error);
+      return this.sendResponse(req, res, {
+        status: 500,
+        message: "Failed to recalculate site material usage",
         error: error.message,
       });
     }

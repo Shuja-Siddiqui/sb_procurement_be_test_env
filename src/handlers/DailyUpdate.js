@@ -463,10 +463,34 @@ class DailyUpdate extends Response {
               .filter((id) => Number.isFinite(id) && id > 0)
           : [];
         const photoIds = [...new Set(incomingPhotoIds ?? previousPhotoIds)];
+        const toNullableNumber = (value) => {
+          if (value === "" || value == null) return null;
+          const parsed = Number(value);
+          return Number.isFinite(parsed) ? parsed : null;
+        };
         return {
           issueId,
           issueType: String(row?.issueType || "").trim(),
           explanation: String(row?.explanation || "").trim(),
+          reason: String(row?.reason ?? existingRow?.reason ?? "").trim(),
+          remainingQty:
+            toNullableNumber(row?.remainingQty) ??
+            toNullableNumber(existingRow?.remainingQty),
+          requestQty:
+            toNullableNumber(row?.requestQty) ??
+            toNullableNumber(existingRow?.requestQty),
+          materialName: String(
+            row?.materialName ?? existingRow?.materialName ?? "",
+          ).trim(),
+          productId:
+            toNullableNumber(row?.productId) ??
+            toNullableNumber(existingRow?.productId),
+          stageNames: Array.isArray(row?.stageNames)
+            ? row.stageNames.filter(Boolean)
+            : Array.isArray(existingRow?.stageNames)
+              ? existingRow.stageNames
+              : [],
+          unit: String(row?.unit ?? existingRow?.unit ?? "").trim(),
           status: String(row?.status || "open").toLowerCase(),
           photoIds,
           createdBy,

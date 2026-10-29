@@ -12,6 +12,11 @@ router.get('/:id', authenticateJWT, handler.getRequestById);
 router.put('/:id', authenticateJWT, handler.updateRequest);
 router.delete('/:id', authenticateJWT, handler.deleteRequest);
 router.get('/site/:siteId',authenticateJWT, handler.getRequestBySiteId);
+router.post(
+  "/site/:siteId/recalculate-usage",
+  authenticateJWT,
+  handler.recalculateSiteUsage,
+);
 router.post("/by-stage", authenticateJWT, handler.getRequestsByStageNameFromBody);
 
 

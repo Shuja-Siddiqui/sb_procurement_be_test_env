@@ -1,5 +1,6 @@
 const Response = require("./Response");
 const prisma = require("../lib/prisma");
+const { recalculateSiteStageUsage } = require("./Requests");
 class StageMaterial extends Response {
 
   createOrUpdate = async (req, res) => {
@@ -189,6 +190,23 @@ class StageMaterial extends Response {
   getBySiteId = async (req, res) => {
     try {
       const siteId = parseInt(req.params.id);
+      if (!Number.isFinite(siteId) || siteId <= 0) {
+        return this.sendResponse(req, res, {
+          message: "Valid siteId is required",
+          status: 400,
+        });
+      }
+
+      // Heal Delivered/Remaining for older sites (QA/Account used to false-commit).
+      try {
+        await recalculateSiteStageUsage(siteId);
+      } catch (recalcError) {
+        console.error(
+          `[StageMaterial.getBySiteId] recalculateSiteStageUsage failed for site ${siteId}:`,
+          recalcError,
+        );
+      }
+
       const material = await prisma.stageMaterial.findUnique({
         where: { siteId },
       });
