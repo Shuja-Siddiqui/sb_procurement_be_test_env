@@ -1173,9 +1173,11 @@ class DailyUpdate extends Response {
 
       const siteId = Number(req.params.siteId);
       const rawLimit = Number(req.query?.limit);
-      const limit =
-        Number.isFinite(rawLimit) && rawLimit > 0
-          ? Math.min(Math.floor(rawLimit), 100)
+      const wantAll = String(req.query?.all || "") === "1";
+      const limit = wantAll
+        ? undefined
+        : Number.isFinite(rawLimit) && rawLimit > 0
+          ? Math.min(Math.floor(rawLimit), 5000)
           : 48;
 
       if (!Number.isFinite(siteId) || siteId <= 0) {
@@ -1187,8 +1189,8 @@ class DailyUpdate extends Response {
 
       const rows = await prisma.dailyUpdatePhoto.findMany({
         where: { siteId },
-        orderBy: { createdAt: "desc" },
-        take: limit,
+        orderBy: [{ date: "desc" }, { createdAt: "desc" }],
+        ...(limit ? { take: limit } : {}),
         select: {
           id: true,
           siteId: true,
