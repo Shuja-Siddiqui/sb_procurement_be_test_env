@@ -6,6 +6,104 @@ const PushNotificationService = require("./PushNotificationService");
 
 const pushNotificationService = new PushNotificationService();
 
+const normalizePlotSizeLabel = (value) =>
+  String(value || "").trim().replace(/\s+/g, " ");
+
+const isOtherPlotSize = (value) => {
+  const normalized = normalizePlotSizeLabel(value).toLowerCase();
+  return !normalized || normalized === "other";
+};
+
+const buildStageMaterialFromTemplates = (templates = []) => {
+  const data = {};
+  let stageNumber = 1;
+
+  templates.forEach((template) => {
+    const stageName = String(template?.name || "").trim();
+    if (!stageName || data[stageName]) return;
+
+    const useZeroQty = isOtherPlotSize(template?.plot_size);
+    const items = (Array.isArray(template?.items) ? template.items : []).map(
+      (item, index) => {
+        const qty = useZeroQty ? 0 : Number(item?.qty || 0);
+        const rate = 0;
+        return {
+          id: index + 1,
+          productId: item.productId,
+          qty: Number.isFinite(qty) ? qty : 0,
+          rate,
+          amount: 0,
+          used_qty: 0,
+          purchase_qty: 0,
+          status: "In Progress",
+        };
+      },
+    );
+
+    data[stageName] = {
+      items,
+      extraMaterial: [],
+      stageNumber: stageNumber++,
+    };
+  });
+
+  return data;
+};
+
+const seedSiteStagesFromPlotSize = async (siteId, plotSize) => {
+  const normalized = normalizePlotSizeLabel(plotSize);
+  let templates = [];
+
+  if (normalized && !isOtherPlotSize(normalized)) {
+    templates = await prisma.stage.findMany({
+      where: { plot_size: { equals: normalized, mode: "insensitive" } },
+      include: {
+        items: {
+          select: { productId: true, qty: true },
+          orderBy: { id: "asc" },
+        },
+      },
+      orderBy: { id: "asc" },
+    });
+  }
+
+  if (!templates.length) {
+    templates = await prisma.stage.findMany({
+      where: {
+        OR: [{ plot_size: "Other" }, { plot_size: "" }],
+      },
+      include: {
+        items: {
+          select: { productId: true, qty: true },
+          orderBy: { id: "asc" },
+        },
+      },
+      orderBy: { id: "asc" },
+    });
+  }
+
+  const data = buildStageMaterialFromTemplates(templates);
+  const stageNames = Object.keys(data);
+  if (!stageNames.length) return null;
+
+  const existing = await prisma.stageMaterial.findUnique({
+    where: { siteId },
+    select: { id: true },
+  });
+  if (existing) return existing;
+
+  const created = await prisma.stageMaterial.create({
+    data: { siteId, data },
+  });
+
+  await prisma.site.update({
+    where: { id: siteId },
+    data: { currentStage: stageNames[0] },
+  });
+
+  return created;
+};
+
 const getIds = (items = []) =>
   (Array.isArray(items) ? items : [])
     .map((i) => Number(i.userId ?? i.ids ?? i.id))
@@ -253,6 +351,16 @@ class Site extends Response {
         skipDuplicates: true,
       });
 
+      let seededStages = null;
+      try {
+        seededStages = await seedSiteStagesFromPlotSize(site.id, plot_size);
+      } catch (seedError) {
+        console.error(
+          `[Sites.create] Failed to seed stages for site ${site.id}:`,
+          seedError?.message || seedError,
+        );
+      }
+
       const relatedUserIds = await pushNotificationService.getSiteRelatedRecipientIds(
         site.id,
         requestingUser.id
@@ -271,9 +379,16 @@ class Site extends Response {
       }
 
       return this.sendResponse(req, res, {
-        message: "Site and group created successfully",
+        message: seededStages
+          ? "Site, group, and stages created successfully"
+          : "Site and group created successfully",
         status: 201,
-        data: { site, groupId: group.id },
+        data: {
+          site,
+          groupId: group.id,
+          stagesSeeded: Boolean(seededStages),
+          stageCount: seededStages ? Object.keys(seededStages.data || {}).length : 0,
+        },
       });
     } catch (error) {
       return this.sendResponse(req, res, {

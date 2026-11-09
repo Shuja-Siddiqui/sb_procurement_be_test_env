@@ -322,10 +322,14 @@ model Product {
 
 model Stage {
   id        Int         @id @default(autoincrement())
-  name      String      @unique
+  name      String
+  plot_size String      @default("")
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
   items     StageItem[]
+
+  @@unique([name, plot_size])
+  @@index([plot_size])
 }
 
 model StageItem {
