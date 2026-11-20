@@ -96,10 +96,24 @@ class MaterialTotal extends Response {
         });
       }
 
+      const limitRaw = Number(req.query.limit);
+      const rows = Array.isArray(material?.data) ? material.data : [];
+      const useLimit =
+        Number.isFinite(limitRaw) && limitRaw > 0 && Array.isArray(material?.data);
+      const limitedData = useLimit
+        ? rows.slice(0, Math.min(Math.floor(limitRaw), 100))
+        : material.data;
+
       return this.sendResponse(req, res, {
         message: "Material total fetched successfully",
         status: 200,
-        data: material,
+        data: useLimit
+          ? {
+              ...material,
+              data: limitedData,
+              totalCount: rows.length,
+            }
+          : material,
       });
     } catch (error) {
       console.error(error);

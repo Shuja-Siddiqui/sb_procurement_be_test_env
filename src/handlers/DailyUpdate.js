@@ -1,8 +1,16 @@
+const fs = require("fs");
+const path = require("path");
 const Response = require("./Response");
 const prisma = require("../lib/prisma");
 const { Role } = require("@prisma/client");
 const PushNotificationService = require("./PushNotificationService");
-const { getApiBaseUrl } = require("../lib/requestUrl");
+const { getApiBaseUrl, getServerOrigin } = require("../lib/requestUrl");
+const {
+  UPLOADS_DIR,
+  UPLOADS_ROOT,
+  saveToUploads,
+  deleteFromUploads,
+} = require("../lib/uploadFile");
 
 const toNumber = (value) => {
   const parsed = parseFloat(value);
@@ -967,22 +975,50 @@ class DailyUpdate extends Response {
     return `${baseUrl}/dailyUpdate/photos/file/${photoId}`;
   };
 
-  mapPhotoRow = (req, row) => ({
-    id: row.id,
-    siteId: row.siteId,
-    siteName: row.site?.name || null,
-    date: row.date,
-    category: row.category,
-    caption: row.caption || "",
-    issueId: row.issueId || null,
-    fileName: row.fileName,
-    mimeType: row.mimeType,
-    size: row.size,
-    uploadedBy: row.uploadedBy,
-    uploadedByName: row.uploadedByName,
-    createdAt: row.createdAt,
-    url: this.buildPhotoUrl(req, row.id),
-  });
+  getDailyUpdatePdfRelativePath = (row) =>
+    path.posix.join(
+      String(row.siteId || "unknown"),
+      "daily-update",
+      `${row.id}-${row.fileName}`,
+    );
+
+  buildUploadsUrl = (req, relativePath) => {
+    if (!relativePath) return "";
+    const relative = String(relativePath)
+      .replace(/^\/+/, "")
+      .replace(new RegExp(`^${UPLOADS_DIR}/`, "i"), "");
+    return `${getServerOrigin(req)}/${UPLOADS_DIR}/${relative}`;
+  };
+
+  isPdfRow = (row) =>
+    String(row?.mimeType || "").toLowerCase() === "application/pdf" ||
+    String(row?.fileName || "").toLowerCase().endsWith(".pdf");
+
+  mapPhotoRow = (req, row) => {
+    const isPdf = this.isPdfRow(row);
+    const filePath = isPdf ? this.getDailyUpdatePdfRelativePath(row) : null;
+
+    return {
+      id: row.id,
+      siteId: row.siteId,
+      siteName: row.site?.name || null,
+      date: row.date,
+      category: row.category,
+      caption: row.caption || "",
+      issueId: row.issueId || null,
+      fileName: row.fileName,
+      mimeType: row.mimeType,
+      size: row.size,
+      filePath,
+      uploadedBy: row.uploadedBy,
+      uploadedByName: row.uploadedByName,
+      createdAt: row.createdAt,
+      // PDFs → /uploads; images/other → previous API blob endpoint
+      url: isPdf
+        ? this.buildUploadsUrl(req, filePath)
+        : this.buildPhotoUrl(req, row.id),
+    };
+  };
 
   uploadPhotos = async (req, res) => {
     try {
@@ -1090,6 +1126,9 @@ class DailyUpdate extends Response {
         const fileName = isImage ? `${baseName}.webp` : originalName;
         const storedMime = isImage ? "image/webp" : mimeType;
 
+        // Images: previous DB blob logic. PDFs: save to uploads (empty DB blob).
+        const dataForDb = isPdf ? Buffer.alloc(0) : buffer;
+
         const row = await prisma.dailyUpdatePhoto.create({
           data: {
             siteId,
@@ -1100,11 +1139,26 @@ class DailyUpdate extends Response {
             fileName,
             mimeType: storedMime,
             size: Number(buffer.length || 0),
-            data: buffer,
+            data: dataForDb,
             uploadedBy: req.user?.id || null,
             uploadedByName: req.user?.name || null,
           },
         });
+
+        if (isPdf) {
+          try {
+            saveToUploads(buffer, fileName, {
+              subDir: path.posix.join(String(siteId), "daily-update"),
+              prefix: String(row.id),
+            });
+          } catch (diskError) {
+            console.error(
+              "Failed to save PDF to uploads folder:",
+              diskError?.message || diskError,
+            );
+          }
+        }
+
         created.push(this.mapPhotoRow(req, row));
       }
 
@@ -1142,11 +1196,18 @@ class DailyUpdate extends Response {
         });
       }
 
+      const dashboardOnly = ["1", "true", "yes"].includes(
+        String(req.query?.dashboard || req.query?.lite || "")
+          .trim()
+          .toLowerCase(),
+      );
       const rawLimit = Number(req.query?.limit);
       const limit =
         Number.isFinite(rawLimit) && rawLimit > 0
-          ? Math.min(Math.floor(rawLimit), 100)
-          : 48;
+          ? Math.min(Math.floor(rawLimit), dashboardOnly ? 24 : 100)
+          : dashboardOnly
+            ? 12
+            : 48;
 
       const rows = await prisma.dailyUpdatePhoto.findMany({
         where: {
@@ -1154,27 +1215,50 @@ class DailyUpdate extends Response {
         },
         orderBy: { createdAt: "desc" },
         take: limit,
-        select: {
-          id: true,
-          siteId: true,
-          date: true,
-          category: true,
-          caption: true,
-          issueId: true,
-          fileName: true,
-          mimeType: true,
-          size: true,
-          uploadedBy: true,
-          uploadedByName: true,
-          createdAt: true,
-          site: { select: { name: true } },
-        },
+        select: dashboardOnly
+          ? {
+              id: true,
+              siteId: true,
+              date: true,
+              category: true,
+              fileName: true,
+              mimeType: true,
+              site: { select: { name: true } },
+            }
+          : {
+              id: true,
+              siteId: true,
+              date: true,
+              category: true,
+              caption: true,
+              issueId: true,
+              fileName: true,
+              mimeType: true,
+              size: true,
+              uploadedBy: true,
+              uploadedByName: true,
+              createdAt: true,
+              site: { select: { name: true } },
+            },
       });
+
+      const data = dashboardOnly
+        ? rows.map((row) => ({
+            id: row.id,
+            siteId: row.siteId,
+            siteName: row.site?.name || null,
+            date: row.date,
+            category: row.category,
+            fileName: row.fileName,
+            mimeType: row.mimeType,
+            url: this.buildPhotoUrl(req, row.id),
+          }))
+        : rows.map((row) => this.mapPhotoRow(req, row));
 
       return this.sendResponse(req, res, {
         status: 200,
         message: "Gallery photos fetched successfully",
-        data: rows.map((row) => this.mapPhotoRow(req, row)),
+        data,
       });
     } catch (error) {
       console.error("Error in get gallery photos:", error);
@@ -1211,8 +1295,21 @@ class DailyUpdate extends Response {
         });
       }
 
+      const imagesOnly =
+        String(req.query.imagesOnly || "")
+          .trim()
+          .toLowerCase() === "1" ||
+        String(req.query.imagesOnly || "")
+          .trim()
+          .toLowerCase() === "true";
+
       const rows = await prisma.dailyUpdatePhoto.findMany({
-        where: { siteId },
+        where: {
+          siteId,
+          ...(imagesOnly
+            ? { mimeType: { startsWith: "image/" } }
+            : {}),
+        },
         orderBy: [{ date: "desc" }, { createdAt: "desc" }],
         ...(limit ? { take: limit } : {}),
         select: {
@@ -1339,23 +1436,78 @@ class DailyUpdate extends Response {
         });
       }
 
-      const row = await prisma.dailyUpdatePhoto.findUnique({
+      const clientEtag = String(req.headers["if-none-match"] || "").trim();
+      const metaSelect = {
+        id: true,
+        siteId: true,
+        date: true,
+        fileName: true,
+        mimeType: true,
+        size: true,
+        createdAt: true,
+      };
+
+      // Conditional requests: metadata only (no Bytes) so 304 stays cheap.
+      // Cold requests: one query including data.
+      const meta = await prisma.dailyUpdatePhoto.findUnique({
         where: { id: photoId },
+        select: clientEtag ? metaSelect : { ...metaSelect, data: true },
       });
-      if (!row?.data) {
+      if (!meta) {
         return this.sendResponse(req, res, {
           status: 404,
           message: "Photo not found",
         });
       }
 
-      res.setHeader("Content-Type", row.mimeType || "image/webp");
+      const etag = `"photo-${meta.id}-${meta.size}-${new Date(
+        meta.createdAt,
+      ).getTime()}"`;
+      res.setHeader("ETag", etag);
+      res.setHeader("Cache-Control", "private, max-age=86400, must-revalidate");
+      res.setHeader("Content-Type", meta.mimeType || "image/webp");
       res.setHeader(
         "Content-Disposition",
-        `inline; filename="${String(row.fileName || "photo").replace(/"/g, "")}"`,
+        `inline; filename="${String(meta.fileName || "photo").replace(/"/g, "")}"`,
       );
-      res.setHeader("Cache-Control", "private, max-age=3600");
-      return res.send(Buffer.from(row.data));
+
+      if (clientEtag && clientEtag === etag) {
+        return res.status(304).end();
+      }
+
+      // PDF → disk file (no DB blob)
+      if (this.isPdfRow(meta)) {
+        const candidates = [
+          path.join(UPLOADS_ROOT, this.getDailyUpdatePdfRelativePath(meta)),
+          path.join(
+            UPLOADS_ROOT,
+            "daily-update",
+            `${meta.id}-${meta.fileName}`,
+          ),
+        ];
+        for (const absolutePath of candidates) {
+          if (fs.existsSync(absolutePath)) {
+            return res.sendFile(absolutePath);
+          }
+        }
+      }
+
+      let blob = meta.data;
+      if (clientEtag && blob == null) {
+        const row = await prisma.dailyUpdatePhoto.findUnique({
+          where: { id: photoId },
+          select: { data: true },
+        });
+        blob = row?.data;
+      }
+      if (!blob || !Buffer.from(blob).length) {
+        return this.sendResponse(req, res, {
+          status: 404,
+          message: "Photo not found",
+        });
+      }
+
+      return res.send(Buffer.from(blob));
     } catch (error) {
       console.error("Error in get daily update photo file:", error);
       return this.sendResponse(req, res, {
@@ -1443,7 +1595,7 @@ class DailyUpdate extends Response {
 
       const existing = await prisma.dailyUpdatePhoto.findUnique({
         where: { id: photoId },
-        select: { id: true },
+        select: { id: true, siteId: true, mimeType: true, fileName: true },
       });
       if (!existing) {
         return this.sendResponse(req, res, {
@@ -1453,6 +1605,22 @@ class DailyUpdate extends Response {
       }
 
       await prisma.dailyUpdatePhoto.delete({ where: { id: photoId } });
+
+      // Remove PDF from uploads folder when present
+      if (this.isPdfRow(existing)) {
+        try {
+          deleteFromUploads(this.getDailyUpdatePdfRelativePath(existing));
+          deleteFromUploads(
+            path.posix.join("daily-update", `${existing.id}-${existing.fileName}`),
+          );
+        } catch (diskError) {
+          console.error(
+            "Failed to delete PDF from uploads folder:",
+            diskError?.message || diskError,
+          );
+        }
+      }
+
       return this.sendResponse(req, res, {
         status: 200,
         message: "Photo deleted successfully",

@@ -88,30 +88,76 @@ const stableQuery = (query = {}) => {
   return entries.map(([k, v]) => `${k}=${v}`).join("&");
 };
 
+/** Binary / streaming paths — do not cache response bodies. */
+const SKIP_GET_CACHE_RE =
+  /\/(chat\/audio|chat\/file|request\/sanitary-image|dailyupdate\/photos\/file|file\/)(\/|$)/i;
+
+/** POST endpoints that are read-only list queries (safe to cache, must not invalidate). */
+const READ_LIKE_POST_RE =
+  /\/(request\/by-stage|stagematerial\/bulk)\/?$/i;
+
+const normalizePath = (req) =>
+  String(req?.originalUrl || req?.url || "")
+    .split("?")[0]
+    .replace(/\/+$/, "")
+    .toLowerCase();
+
+const isReadLikePost = (req) => {
+  const method = String(req?.method || "").toUpperCase();
+  if (method !== "POST") return false;
+  return READ_LIKE_POST_RE.test(normalizePath(req));
+};
+
+const shouldSkipGetCache = (req) => {
+  const method = String(req?.method || "").toUpperCase();
+  const path = normalizePath(req);
+  if (SKIP_GET_CACHE_RE.test(path)) return true;
+  if (method === "GET") return false;
+  if (isReadLikePost(req)) return false;
+  return true;
+};
+
+const isMutatingMethod = (method, req) => {
+  const m = String(method || "").toUpperCase();
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(m)) return false;
+  // Read-style POSTs must not bump the global cache version.
+  if (req && isReadLikePost(req)) return false;
+  return true;
+};
+
+const stableBody = (body = {}) => {
+  try {
+    if (body == null || typeof body !== "object") return String(body ?? "");
+    const normalized = {};
+    Object.keys(body)
+      .sort()
+      .forEach((key) => {
+        const value = body[key];
+        if (value == null || value === "") return;
+        if (typeof value === "object") {
+          normalized[key] = JSON.stringify(value);
+        } else {
+          normalized[key] = String(value);
+        }
+      });
+    return JSON.stringify(normalized);
+  } catch {
+    return "";
+  }
+};
+
 const buildGetCacheKey = async (req) => {
   const ver = await getVersion();
   const userId = req?.user?.id ?? "anon";
   const role = req?.user?.role ?? "unknown";
-  const path = String(req?.originalUrl || req?.url || "")
-    .split("?")[0]
-    .replace(/\/+$/, "")
-    .toLowerCase();
+  const path = normalizePath(req);
   const query = stableQuery(req?.query);
-  return `api:get:${ver}:${userId}:${role}:${path}?${query}`;
+  const body =
+    String(req?.method || "").toUpperCase() === "POST"
+      ? stableBody(req?.body)
+      : "";
+  return `api:get:${ver}:${userId}:${role}:${path}?${query}&b=${body}`;
 };
-
-/** Binary / streaming GET paths — do not cache. */
-const SKIP_GET_CACHE_RE =
-  /\/(chat\/audio|chat\/file|request\/sanitary-image|file\/)(\/|$)/i;
-
-const shouldSkipGetCache = (req) => {
-  if (String(req?.method || "").toUpperCase() !== "GET") return true;
-  const path = String(req?.originalUrl || req?.url || "").split("?")[0];
-  return SKIP_GET_CACHE_RE.test(path);
-};
-
-const isMutatingMethod = (method) =>
-  ["POST", "PUT", "PATCH", "DELETE"].includes(String(method || "").toUpperCase());
 
 module.exports = {
   getRedis,
@@ -123,5 +169,6 @@ module.exports = {
   buildGetCacheKey,
   shouldSkipGetCache,
   isMutatingMethod,
+  isReadLikePost,
   GET_TTL_SECONDS,
 };

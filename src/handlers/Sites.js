@@ -6,117 +6,19 @@ const PushNotificationService = require("./PushNotificationService");
 
 const pushNotificationService = new PushNotificationService();
 
-const normalizePlotSizeLabel = (value) =>
-  String(value || "").trim().replace(/\s+/g, " ");
-
-const isOtherPlotSize = (value) => {
-  const normalized = normalizePlotSizeLabel(value).toLowerCase();
-  return !normalized || normalized === "other";
-};
-
-const buildStageMaterialFromTemplates = (templates = []) => {
-  const data = {};
-  let stageNumber = 1;
-
-  templates.forEach((template) => {
-    const stageName = String(template?.name || "").trim();
-    if (!stageName || data[stageName]) return;
-
-    const useZeroQty = isOtherPlotSize(template?.plot_size);
-    const items = (Array.isArray(template?.items) ? template.items : []).map(
-      (item, index) => {
-        const qty = useZeroQty ? 0 : Number(item?.qty || 0);
-        const rate = 0;
-        return {
-          id: index + 1,
-          productId: item.productId,
-          qty: Number.isFinite(qty) ? qty : 0,
-          rate,
-          amount: 0,
-          used_qty: 0,
-          purchase_qty: 0,
-          status: "In Progress",
-        };
-      },
-    );
-
-    data[stageName] = {
-      items,
-      extraMaterial: [],
-      stageNumber: stageNumber++,
-    };
-  });
-
-  return data;
-};
-
-const seedSiteStagesFromPlotSize = async (siteId, plotSize) => {
-  const normalized = normalizePlotSizeLabel(plotSize);
-  let templates = [];
-
-  if (normalized && !isOtherPlotSize(normalized)) {
-    templates = await prisma.stage.findMany({
-      where: { plot_size: { equals: normalized, mode: "insensitive" } },
-      include: {
-        items: {
-          select: { productId: true, qty: true },
-          orderBy: { id: "asc" },
-        },
-      },
-      orderBy: { id: "asc" },
-    });
-  }
-
-  if (!templates.length) {
-    templates = await prisma.stage.findMany({
-      where: {
-        OR: [{ plot_size: "Other" }, { plot_size: "" }],
-      },
-      include: {
-        items: {
-          select: { productId: true, qty: true },
-          orderBy: { id: "asc" },
-        },
-      },
-      orderBy: { id: "asc" },
-    });
-  }
-
-  const data = buildStageMaterialFromTemplates(templates);
-  const stageNames = Object.keys(data);
-  if (!stageNames.length) return null;
-
-  const existing = await prisma.stageMaterial.findUnique({
-    where: { siteId },
-    select: { id: true },
-  });
-  if (existing) return existing;
-
-  const created = await prisma.stageMaterial.create({
-    data: { siteId, data },
-  });
-
-  await prisma.site.update({
-    where: { id: siteId },
-    data: { currentStage: stageNames[0] },
-  });
-
-  return created;
-};
-
 const getIds = (items = []) =>
   (Array.isArray(items) ? items : [])
-    .map((i) => Number(i.userId ?? i.ids ?? i.id))
-    .filter((id) => Number.isFinite(id));
+    .map((i) => Number(i?.userId ?? i?.ids ?? i?.id))
+    .filter((id) => Number.isFinite(id) && id > 0);
 
 const normalizePurchasers = (items = []) =>
   (Array.isArray(items) ? items : [])
     .map((item) => {
       const userId = Number(item?.userId ?? item?.ids ?? item?.id);
-      if (!Number.isFinite(userId)) return null;
+      if (!Number.isFinite(userId) || userId <= 0) return null;
       const productIds = (Array.isArray(item?.productIds) ? item.productIds : [])
         .map((id) => Number(id))
-        .filter((id) => Number.isFinite(id));
+        .filter((id) => Number.isFinite(id) && id > 0);
       return {
         userId,
         status: String(item?.status || "active").toLowerCase(),
@@ -146,6 +48,112 @@ const formatSiteStatusLabel = (status) => {
   return status || "Updated";
 };
 
+/** Copy plot-size stage templates into a new site's StageMaterial + MaterialTotal. */
+const seedSiteStagesFromPlotSize = async (siteId, plotSizeName) => {
+  const name = String(plotSizeName || "").trim();
+  if (!Number.isFinite(Number(siteId)) || !name) return null;
+
+  const plotSize = await prisma.plotSize.findFirst({
+    where: { name: { equals: name, mode: "insensitive" } },
+    select: { id: true, name: true },
+  });
+  if (!plotSize) return null;
+
+  const templateStages = await prisma.stage.findMany({
+    where: { plotSizeId: plotSize.id },
+    include: {
+      items: {
+        select: { productId: true, qty: true },
+        orderBy: { id: "asc" },
+      },
+    },
+    orderBy: { id: "asc" },
+  });
+  if (!templateStages.length) return null;
+
+  const existing = await prisma.stageMaterial.findUnique({
+    where: { siteId: Number(siteId) },
+    select: { id: true },
+  });
+  if (existing) return null;
+
+  const stageData = {};
+  const totalsMap = {};
+
+  templateStages.forEach((stage, stageIndex) => {
+    const items = (stage.items || []).map((item, itemIndex) => {
+      const qty = Number(item.qty);
+      const safeQty = Number.isFinite(qty) ? qty : 0;
+      const productId = Number(item.productId);
+      if (Number.isFinite(productId) && productId > 0) {
+        if (!totalsMap[productId]) {
+          totalsMap[productId] = {
+            productId,
+            quantity: 0,
+            used_qty: 0,
+            rate: 0,
+            purchase_qty: 0,
+            amount: 0,
+          };
+        }
+        totalsMap[productId].quantity = Number(
+          (totalsMap[productId].quantity + safeQty).toFixed(6),
+        );
+      }
+      return {
+        id: itemIndex + 1,
+        productId,
+        qty: safeQty,
+        used_qty: 0,
+        purchase_qty: 0,
+        rate: 0,
+        amount: 0,
+      };
+    });
+
+    stageData[stage.name] = {
+      stageNumber: stageIndex + 1,
+      status: "Not Started",
+      items,
+      extraMaterial: [],
+    };
+  });
+
+  await prisma.stageMaterial.create({
+    data: {
+      siteId: Number(siteId),
+      data: stageData,
+    },
+  });
+
+  await prisma.materialTotal.upsert({
+    where: { siteId: Number(siteId) },
+    update: {
+      data: Object.values(totalsMap),
+      file_name: `auto-${plotSize.name}`,
+    },
+    create: {
+      siteId: Number(siteId),
+      data: Object.values(totalsMap),
+      file_name: `auto-${plotSize.name}`,
+    },
+  });
+
+  const firstStageName = templateStages[0]?.name || null;
+  if (firstStageName) {
+    await prisma.site.update({
+      where: { id: Number(siteId) },
+      data: { currentStage: firstStageName },
+    });
+  }
+
+  return {
+    plotSize: plotSize.name,
+    stageCount: templateStages.length,
+    currentStage: firstStageName,
+  };
+};
+
 const siteAssigneesInclude = {
   supervisors: {
     include: { user: { select: { id: true, name: true, role: true } } },
@@ -157,6 +165,33 @@ const siteAssigneesInclude = {
     include: { user: { select: { id: true, name: true, role: true } } },
   },
 };
+
+/** Main dashboard charts/counts + overview table — minimal payload. */
+const siteDashboardSelect = {
+  id: true,
+  name: true,
+  client_name: true,
+  status: true,
+  created_at: true,
+  currentStage: true,
+  startDate: true,
+  endDate: true,
+};
+
+/** Sites list cards/filters without assignee graphs. */
+const siteListLiteSelect = {
+  id: true,
+  name: true,
+  client_name: true,
+  city: true,
+  province: true,
+  plot_size: true,
+  status: true,
+  created_at: true,
+};
+
+const wantsTruthyQuery = (value) =>
+  ["1", "true", "yes"].includes(String(value || "").trim().toLowerCase());
 
 const buildSiteAccessWhere = (userId, userRole) => {
   const parsedUserId = Number(userId);
@@ -279,9 +314,9 @@ class Site extends Response {
   create = async (req, res) => {
     try {
       const { name, address, client_name, city, province, plot_size, status } = req.body;
-      const supervisorIds = getIds(req.body.supervisors);
-      const purchaserRows = normalizePurchasers(req.body.purchasers);
-      const seniorEngineerIds = getIds(req.body.seniorEngineers);
+      let supervisorIds = getIds(req.body.supervisors);
+      let purchaserRows = normalizePurchasers(req.body.purchasers);
+      let seniorEngineerIds = getIds(req.body.seniorEngineers);
 
       const requestingUser = await prisma.user.findUnique({
         where: { id: req.user?.id },
@@ -293,6 +328,69 @@ class Site extends Response {
         });
       }
 
+      const hasNoAssignees =
+        supervisorIds.length === 0 &&
+        purchaserRows.length === 0 &&
+        seniorEngineerIds.length === 0;
+
+      // Admin and Super Admin may create a site without supervisor / purchaser / senior engineer.
+      const canCreateWithoutAssignees = [Role.SUPER_ADMIN, Role.ADMIN].includes(
+        requestingUser.role,
+      );
+      if (hasNoAssignees && !canCreateWithoutAssignees) {
+        return this.sendResponse(req, res, {
+          message:
+            "Assign at least one Supervisor, Purchaser, or Senior Engineer.",
+          status: 400,
+        });
+      }
+
+      // Keep only user IDs that actually exist (prevents SiteSupervisor_userId_fkey 500).
+      const candidateIds = uniqueUserIds([
+        ...supervisorIds,
+        ...purchaserRows.map((p) => p.userId),
+        ...seniorEngineerIds,
+      ]);
+      if (candidateIds.length > 0) {
+        const existingUsers = await prisma.user.findMany({
+          where: { id: { in: candidateIds } },
+          select: { id: true },
+        });
+        const validIds = new Set(existingUsers.map((u) => Number(u.id)));
+        supervisorIds = supervisorIds.filter((id) => validIds.has(id));
+        purchaserRows = purchaserRows.filter((row) => validIds.has(row.userId));
+        seniorEngineerIds = seniorEngineerIds.filter((id) => validIds.has(id));
+
+        const stillNoAssignees =
+          supervisorIds.length === 0 &&
+          purchaserRows.length === 0 &&
+          seniorEngineerIds.length === 0;
+        if (stillNoAssignees && !canCreateWithoutAssignees) {
+          return this.sendResponse(req, res, {
+            message:
+              "Selected assignees are invalid. Assign a valid Supervisor, Purchaser, or Senior Engineer.",
+            status: 400,
+          });
+        }
+      }
+
+      // Normalize plot size to master PlotSize name when possible.
+      let resolvedPlotSize = String(plot_size || "").trim();
+      const plotSizeIdRaw = req.body?.plotSizeId ?? req.body?.plot_size_id;
+      if (plotSizeIdRaw != null && plotSizeIdRaw !== "") {
+        const byId = await prisma.plotSize.findUnique({
+          where: { id: Number(plotSizeIdRaw) },
+          select: { name: true },
+        });
+        if (byId?.name) resolvedPlotSize = byId.name;
+      } else if (resolvedPlotSize) {
+        const byName = await prisma.plotSize.findFirst({
+          where: { name: { equals: resolvedPlotSize, mode: "insensitive" } },
+          select: { name: true },
+        });
+        if (byName?.name) resolvedPlotSize = byName.name;
+      }
+
       const site = await prisma.site.create({
         data: {
           name,
@@ -300,7 +398,7 @@ class Site extends Response {
           client_name,
           city,
           province,
-          plot_size,
+          plot_size: resolvedPlotSize,
           status,
           locationUrl: req.body.locationUrl ?? req.body.location_url ?? null,
           coveredArea: req.body.coveredArea ?? req.body.covered_area ?? null,
@@ -321,6 +419,23 @@ class Site extends Response {
         },
         include: siteAssigneesInclude,
       });
+
+      let seededStages = null;
+      try {
+        seededStages = await seedSiteStagesFromPlotSize(site.id, resolvedPlotSize);
+      } catch (seedError) {
+        console.error(
+          `[Sites.create] Failed to seed stages for plot size "${resolvedPlotSize}":`,
+          seedError,
+        );
+      }
+
+      const refreshedSite = seededStages?.currentStage
+        ? await prisma.site.findUnique({
+            where: { id: site.id },
+            include: siteAssigneesInclude,
+          })
+        : site;
 
       const group = await prisma.chatGroup.create({
         data: { name: site.name, createdById: requestingUser.id },
@@ -351,16 +466,6 @@ class Site extends Response {
         skipDuplicates: true,
       });
 
-      let seededStages = null;
-      try {
-        seededStages = await seedSiteStagesFromPlotSize(site.id, plot_size);
-      } catch (seedError) {
-        console.error(
-          `[Sites.create] Failed to seed stages for site ${site.id}:`,
-          seedError?.message || seedError,
-        );
-      }
-
       const relatedUserIds = await pushNotificationService.getSiteRelatedRecipientIds(
         site.id,
         requestingUser.id
@@ -380,14 +485,13 @@ class Site extends Response {
 
       return this.sendResponse(req, res, {
         message: seededStages
-          ? "Site, group, and stages created successfully"
+          ? `Site created and ${seededStages.stageCount} plot-size stage(s) added automatically`
           : "Site and group created successfully",
         status: 201,
         data: {
-          site,
+          site: refreshedSite,
           groupId: group.id,
-          stagesSeeded: Boolean(seededStages),
-          stageCount: seededStages ? Object.keys(seededStages.data || {}).length : 0,
+          seededStages,
         },
       });
     } catch (error) {
@@ -409,13 +513,27 @@ class Site extends Response {
       const limitParam = req.query.limit;
       const usePagination = pageParam != null || limitParam != null;
 
-      // Backward compatible: callers without page/limit still get a full array.
+      // Callers without page/limit get an array. Default is a slim select —
+      // full assignee payload only when explicitly requested.
       if (!usePagination) {
-        const allSites = await prisma.site.findMany({
-          where: accessWhere,
-          orderBy: { created_at: "desc" },
-          include: siteAssigneesInclude,
-        });
+        const includeAssignees = wantsTruthyQuery(
+          req.query.includeAssignees || req.query.full,
+        );
+        const dashboardOnly = wantsTruthyQuery(
+          req.query.dashboard || req.query.lite,
+        );
+
+        const allSites = includeAssignees
+          ? await prisma.site.findMany({
+              where: accessWhere,
+              orderBy: { created_at: "desc" },
+              include: siteAssigneesInclude,
+            })
+          : await prisma.site.findMany({
+              where: accessWhere,
+              orderBy: { created_at: "desc" },
+              select: dashboardOnly ? siteDashboardSelect : siteListLiteSelect,
+            });
 
         return this.sendResponse(req, res, {
           message: "Sites fetched successfully",
@@ -425,7 +543,7 @@ class Site extends Response {
       }
 
       const page = Math.max(1, parseInt(pageParam, 10) || 1);
-      const limit = Math.min(100, Math.max(1, parseInt(limitParam, 10) || 10));
+      const limit = Math.min(150, Math.max(1, parseInt(limitParam, 10) || 10));
 
       const search = String(req.query.search || "").trim();
       const city = String(req.query.city || "").trim();
@@ -462,16 +580,14 @@ class Site extends Response {
       const tabCountWhere = { ...listWhere };
       delete tabCountWhere.status;
 
-      const [total, statusGroups, filterRows] = await Promise.all([
+      // Count + status tabs + page rows only. City/province/plot-size filter
+      // dropdowns are static (or separate APIs) — do not scan all sites here.
+      const [total, statusGroups] = await Promise.all([
         prisma.site.count({ where: listWhere }),
         prisma.site.groupBy({
           by: ["status"],
           where: tabCountWhere,
           _count: { _all: true },
-        }),
-        prisma.site.findMany({
-          where: accessWhere,
-          select: { city: true, province: true, plot_size: true },
         }),
       ]);
 
@@ -479,18 +595,29 @@ class Site extends Response {
       const safePage = Math.min(page, totalPages);
       const skip = (safePage - 1) * limit;
 
-      const sites = await prisma.site.findMany({
-        where: listWhere,
-        orderBy: { created_at: "desc" },
-        include: siteAssigneesInclude,
-        skip,
-        take: limit,
-      });
+      // Site Management needs assignees/full fields; Sites/Home use lite rows.
+      const includeAssignees = wantsTruthyQuery(
+        req.query.includeAssignees || req.query.full,
+      );
+      const dashboardOnly = wantsTruthyQuery(
+        req.query.dashboard || req.query.lite,
+      );
 
-      const uniqueSorted = (values) =>
-        [...new Set(values.map((v) => String(v || "").trim()).filter(Boolean))].sort(
-          (a, b) => a.localeCompare(b),
-        );
+      const sites = includeAssignees
+        ? await prisma.site.findMany({
+            where: listWhere,
+            orderBy: { created_at: "desc" },
+            include: siteAssigneesInclude,
+            skip,
+            take: limit,
+          })
+        : await prisma.site.findMany({
+            where: listWhere,
+            orderBy: { created_at: "desc" },
+            select: dashboardOnly ? siteDashboardSelect : siteListLiteSelect,
+            skip,
+            take: limit,
+          });
 
       return this.sendResponse(req, res, {
         message: "Sites fetched successfully",
@@ -506,11 +633,6 @@ class Site extends Response {
             to: Math.min(skip + sites.length, total),
           },
           statusCounts: buildStatusCounts(statusGroups),
-          filterOptions: {
-            cities: uniqueSorted(filterRows.map((row) => row.city)),
-            provinces: uniqueSorted(filterRows.map((row) => row.province)),
-            plotSizes: uniqueSorted(filterRows.map((row) => row.plot_size)),
-          },
         },
       });
     } catch (error) {
@@ -525,10 +647,34 @@ class Site extends Response {
   getById = async (req, res) => {
     try {
       const id = Number(req.params.id);
-      const site = await prisma.site.findUnique({
-        where: { id },
-        include: siteAssigneesInclude,
-      });
+      const lite =
+        String(req.query.lite || req.query.summary || "")
+          .trim()
+          .toLowerCase() === "1" ||
+        String(req.query.lite || req.query.summary || "")
+          .trim()
+          .toLowerCase() === "true";
+
+      const site = lite
+        ? await prisma.site.findUnique({
+            where: { id },
+            select: {
+              id: true,
+              name: true,
+              client_name: true,
+              status: true,
+              currentStage: true,
+              startDate: true,
+              endDate: true,
+              city: true,
+              province: true,
+              plot_size: true,
+            },
+          })
+        : await prisma.site.findUnique({
+            where: { id },
+            include: siteAssigneesInclude,
+          });
       if (!site) {
         return this.sendResponse(req, res, { message: "Site not found", status: 404 });
       }
@@ -849,10 +995,25 @@ class Site extends Response {
     try {
       const siteId = Number(req.params.id);
       const site = await prisma.site.findUnique({ where: { id: siteId } });
-      if (!site) return this.sendResponse(req, res, { message: "Site not found", status: 404 });
+      if (!site) {
+        return this.sendResponse(req, res, {
+          message: "Site not found",
+          status: 404,
+        });
+      }
+
+      const actorId = Number(req.user?.id) || null;
+      const actor = actorId
+        ? await prisma.user.findUnique({
+            where: { id: actorId },
+            select: { id: true, name: true, role: true },
+          })
+        : null;
 
       await prisma.$transaction(async (tx) => {
-        const group = await tx.chatGroup.findFirst({ where: { name: site.name } });
+        const group = await tx.chatGroup.findFirst({
+          where: { name: site.name },
+        });
         if (group) {
           await tx.chatMember.deleteMany({ where: { groupId: group.id } });
           await tx.chatGroup.delete({ where: { id: group.id } });
@@ -864,6 +1025,44 @@ class Site extends Response {
 
         await tx.site.delete({ where: { id: siteId } });
       });
+
+      // Notify Admin / Super Admin (exclude the actor who deleted).
+      const admins = await prisma.user.findMany({
+        where: { role: { in: [Role.ADMIN, Role.SUPER_ADMIN] } },
+        select: { id: true },
+      });
+      const recipientIds = uniqueUserIds(
+        admins.map((u) => u.id).filter((id) => id !== actorId),
+      );
+
+      if (recipientIds.length > 0) {
+        const message = pushNotificationService.buildSiteActivityMessage({
+          action: "deleted",
+          actorRole: actor?.role || req.user?.role,
+          actorName: actor?.name || req.user?.name || "User",
+          siteName: site.name,
+        });
+        pushNotificationService
+          .dispatchNotifications({
+            event: "SITE_DELETED",
+            senderId: actorId,
+            recipientIds,
+            title: message.title,
+            body: message.body,
+            type: message.type,
+            data: {
+              siteId,
+              action: "deleted",
+              siteName: site.name,
+            },
+          })
+          .catch((err) => {
+            console.error(
+              "[Sites.delete] failed to notify admins:",
+              err?.message || err,
+            );
+          });
+      }
 
       return this.sendResponse(req, res, {
         message: "Site and related chat group deleted successfully",

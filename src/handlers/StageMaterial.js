@@ -1,7 +1,52 @@
 const Response = require("./Response");
 const prisma = require("../lib/prisma");
 const { recalculateSiteStageUsage } = require("./Requests");
+const { safeGet, safeSet, safeDel } = require("../lib/redis");
+const { timedDbForReq, attachRequestTiming } = require("../lib/perf");
+
+/** Skip expensive heal if this site was healed recently (seconds). */
+const HEAL_TTL_SECONDS = Number(process.env.STAGE_MATERIAL_HEAL_TTL_SECONDS) || 600;
+
+const wantsTruthy = (value) =>
+  ["1", "true", "yes"].includes(String(value || "").trim().toLowerCase());
+
+const parseSiteIds = (raw) => {
+  const list = Array.isArray(raw)
+    ? raw
+    : String(raw || "")
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean);
+  const ids = [
+    ...new Set(
+      list
+        .map((v) => Number(v))
+        .filter((id) => Number.isFinite(id) && id > 0),
+    ),
+  ];
+  return ids.slice(0, 100);
+};
+
 class StageMaterial extends Response {
+  /**
+   * Recalc only when explicitly requested, or when heal cache is cold.
+   * Dashboard / bulk reads should pass skipRecalc=1.
+   */
+  maybeHealSite = async (siteId, { force = false, skip = false, req } = {}) => {
+    if (skip && !force) return false;
+    if (!force) {
+      const cached = await safeGet(`stageheal:${siteId}`);
+      if (cached) return false;
+    }
+    await timedDbForReq(
+      req,
+      "recalculateSiteStageUsage",
+      () => recalculateSiteStageUsage(siteId),
+      { siteId },
+    );
+    await safeSet(`stageheal:${siteId}`, 1, HEAL_TTL_SECONDS);
+    return true;
+  };
 
   createOrUpdate = async (req, res) => {
     try {
@@ -170,6 +215,12 @@ class StageMaterial extends Response {
         create: { siteId, data: formattedData },
       });
 
+      try {
+        await safeDel(`stageheal:${siteId}`);
+      } catch {
+        /* ignore */
+      }
+
       return res.status(200).json({
         message:
           "Stage material saved, duplicates merged, material total updated, extra material consumed",
@@ -186,10 +237,11 @@ class StageMaterial extends Response {
     }
   };
 
-  // Get MaterialTotal by siteId
+  // Get StageMaterial by siteId
   getBySiteId = async (req, res) => {
+    attachRequestTiming(req, res, `GET /stageMaterial/${req.params.id}`);
     try {
-      const siteId = parseInt(req.params.id);
+      const siteId = parseInt(req.params.id, 10);
       if (!Number.isFinite(siteId) || siteId <= 0) {
         return this.sendResponse(req, res, {
           message: "Valid siteId is required",
@@ -197,9 +249,18 @@ class StageMaterial extends Response {
         });
       }
 
-      // Heal Delivered/Remaining for older sites (QA/Account used to false-commit).
+      // Dashboard / overview: skipRecalc=1. Otherwise heal at most every HEAL_TTL.
+      const skipRecalc = wantsTruthy(
+        req.query.skipRecalc || req.query.summary || req.query.dashboard,
+      );
+      const forceRecalc = wantsTruthy(req.query.recalc || req.query.heal);
+
       try {
-        await recalculateSiteStageUsage(siteId);
+        await this.maybeHealSite(siteId, {
+          skip: skipRecalc,
+          force: forceRecalc,
+          req,
+        });
       } catch (recalcError) {
         console.error(
           `[StageMaterial.getBySiteId] recalculateSiteStageUsage failed for site ${siteId}:`,
@@ -207,9 +268,12 @@ class StageMaterial extends Response {
         );
       }
 
-      const material = await prisma.stageMaterial.findUnique({
-        where: { siteId },
-      });
+      const material = await timedDbForReq(
+        req,
+        "stageMaterial.findUnique",
+        () => prisma.stageMaterial.findUnique({ where: { siteId } }),
+        { siteId },
+      );
 
       if (!material) {
         return this.sendResponse(req, res, {
@@ -227,6 +291,78 @@ class StageMaterial extends Response {
       console.error(error);
       return this.sendResponse(req, res, {
         message: "Failed to fetch material total",
+        status: 500,
+      });
+    }
+  };
+
+  /**
+   * Bulk fetch stage materials for many sites (dashboard progress).
+   * POST /stageMaterial/bulk  { siteIds: number[], skipRecalc?: true }
+   */
+  getBulkBySiteIds = async (req, res) => {
+    attachRequestTiming(req, res, "POST /stageMaterial/bulk");
+    try {
+      const siteIds = parseSiteIds(req.body?.siteIds || req.query?.siteIds);
+      if (!siteIds.length) {
+        return this.sendResponse(req, res, {
+          message: "siteIds is required",
+          status: 400,
+        });
+      }
+
+      const skipRecalc =
+        req.body?.skipRecalc !== undefined
+          ? wantsTruthy(req.body.skipRecalc)
+          : req.query?.skipRecalc !== undefined
+            ? wantsTruthy(req.query.skipRecalc)
+            : true; // bulk/dashboard reads skip heal by default
+      const forceRecalc = wantsTruthy(req.body?.recalc || req.query?.recalc);
+
+      if (!skipRecalc || forceRecalc) {
+        await Promise.all(
+          siteIds.map((siteId) =>
+            this.maybeHealSite(siteId, {
+              skip: skipRecalc && !forceRecalc,
+              force: forceRecalc,
+              req,
+            }).catch((err) => {
+              console.error(
+                `[StageMaterial.bulk] heal failed site=${siteId}:`,
+                err?.message || err,
+              );
+            }),
+          ),
+        );
+      }
+
+      const rows = await timedDbForReq(
+        req,
+        "stageMaterial.findMany(bulk)",
+        () =>
+          prisma.stageMaterial.findMany({
+            where: { siteId: { in: siteIds } },
+          }),
+        { meta: { count: siteIds.length } },
+      );
+
+      const bySiteId = {};
+      siteIds.forEach((id) => {
+        bySiteId[id] = null;
+      });
+      rows.forEach((row) => {
+        bySiteId[row.siteId] = row;
+      });
+
+      return this.sendResponse(req, res, {
+        message: "Stage materials fetched successfully",
+        status: 200,
+        data: { bySiteId, siteIds },
+      });
+    } catch (error) {
+      console.error(error);
+      return this.sendResponse(req, res, {
+        message: "Failed to fetch stage materials",
         status: 500,
       });
     }

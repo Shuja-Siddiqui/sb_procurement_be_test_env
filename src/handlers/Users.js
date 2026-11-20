@@ -245,7 +245,7 @@ class Users extends Response {
     }
   };
 
-  // Get all users
+  // Get all users (paginated when page/limit provided)
   getUsers = async (req, res) => {
     try {
       if (!this.hasUserManagementAccess(req)) {
@@ -254,33 +254,200 @@ class Users extends Response {
           message: "Only Super Admin, Director, or Admin can view users",
         });
       }
-      const users = await prisma.user.findMany({
-        include: {
-          purchaserProducts: { select: { productId: true } },
-          _count: {
-            select: {
-              updatedSites: true,
-              siteSupervisors: true,
-              sitePurchasers: true,
-              siteSeniorEngineers: true,
-            },
+
+      const pageParam = req.query.page;
+      const limitParam = req.query.limit;
+      const usePagination = pageParam != null || limitParam != null;
+
+      const search = String(req.query.search || "").trim();
+      const roleFilterRaw = String(req.query.role || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "_");
+      const statusFilter = String(req.query.status || "")
+        .trim()
+        .toLowerCase();
+
+      const roleQueryMap = {
+        super_admin: Role.SUPER_ADMIN,
+        admin: Role.ADMIN,
+        qa: Role.QA,
+        account: Role.ACCOUNT,
+        accountant: Role.ACCOUNT,
+        director: Role.DIRECTOR,
+        supervisor: Role.SUPERVISOR,
+        purchaser: Role.PURCHASER,
+        sr_engineer: Role.SR_ENGINEER,
+      };
+
+      const where = {};
+      if (roleFilterRaw) {
+        const mappedRole =
+          roleQueryMap[roleFilterRaw] ||
+          Object.values(Role).find(
+            (r) => String(r).toLowerCase() === roleFilterRaw,
+          );
+        if (mappedRole) where.role = mappedRole;
+      }
+      if (statusFilter) {
+        where.status = { equals: statusFilter, mode: "insensitive" };
+      }
+      if (search) {
+        where.OR = [
+          { name: { contains: search, mode: "insensitive" } },
+          { email: { contains: search, mode: "insensitive" } },
+          { number: { contains: search, mode: "insensitive" } },
+          { cnic: { contains: search, mode: "insensitive" } },
+        ];
+      }
+
+      const userListSelect = {
+        id: true,
+        name: true,
+        email: true,
+        cnic: true,
+        gender: true,
+        number: true,
+        role: true,
+        status: true,
+        alreadyAssigned: true,
+        purchaserAllProducts: true,
+        isEdit: true,
+        createdAt: true,
+        updatedAt: true,
+        purchaserProducts: { select: { productId: true } },
+        _count: {
+          select: {
+            updatedSites: true,
+            siteSupervisors: true,
+            sitePurchasers: true,
+            siteSeniorEngineers: true,
           },
         },
-      });
+      };
+
       const totalSites = await prisma.site.count();
+      const mapUser = (u) => {
+        const { purchaserProducts, _count, ...rest } = u;
+        return {
+          ...rest,
+          productIds: purchaserProducts?.map((p) => p.productId) || [],
+          assignedSiteCount: [
+            Role.SUPER_ADMIN,
+            Role.ADMIN,
+            Role.DIRECTOR,
+            Role.QA,
+            Role.ACCOUNT,
+          ].includes(u.role)
+            ? totalSites
+            : Number(_count?.updatedSites || 0) +
+              Number(_count?.siteSupervisors || 0) +
+              Number(_count?.sitePurchasers || 0) +
+              Number(_count?.siteSeniorEngineers || 0),
+        };
+      };
+
+      // Backward compatible: no page/limit → full array (no password).
+      if (!usePagination) {
+        const users = await prisma.user.findMany({
+          where,
+          select: userListSelect,
+          orderBy: { name: "asc" },
+        });
+        return this.sendResponse(req, res, {
+          status: 200,
+          data: users.map(mapUser),
+        });
+      }
+
+      const page = Math.max(1, parseInt(pageParam, 10) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(limitParam, 10) || 10));
+
+      // Tab/KPI counts ignore status filter so Active/Inactive totals stay stable.
+      const tabCountWhere = { ...where };
+      delete tabCountWhere.status;
+
+      const [
+        total,
+        statusGroups,
+        unfilteredTotal,
+        unfilteredStatusGroups,
+        unfilteredRoleGroups,
+        assignmentRows,
+      ] = await Promise.all([
+        prisma.user.count({ where }),
+        prisma.user.groupBy({
+          by: ["status"],
+          where: tabCountWhere,
+          _count: { _all: true },
+        }),
+        prisma.user.count(),
+        prisma.user.groupBy({
+          by: ["status"],
+          _count: { _all: true },
+        }),
+        prisma.user.groupBy({
+          by: ["role"],
+          _count: { _all: true },
+        }),
+        Promise.all([
+          prisma.siteSupervisor.count(),
+          prisma.sitePurchaser.count(),
+          prisma.siteSeniorEngineer.count(),
+        ]),
+      ]);
+
+      const totalPages = Math.max(1, Math.ceil(total / limit) || 1);
+      const safePage = Math.min(page, totalPages);
+      const skip = (safePage - 1) * limit;
+
+      const users = await prisma.user.findMany({
+        where,
+        select: userListSelect,
+        orderBy: { name: "asc" },
+        skip,
+        take: limit,
+      });
+
+      const mapped = users.map(mapUser);
+      const statusCounts = { all: 0, active: 0, inactive: 0 };
+      statusGroups.forEach((row) => {
+        const key = String(row.status || "").toLowerCase();
+        const count = row?._count?._all || 0;
+        statusCounts.all += count;
+        if (key === "active") statusCounts.active += count;
+        else statusCounts.inactive += count;
+      });
+
+      let activeAll = 0;
+      unfilteredStatusGroups.forEach((row) => {
+        if (String(row.status || "").toLowerCase() === "active") {
+          activeAll += row?._count?._all || 0;
+        }
+      });
+      const [supCount, purchCount, seCount] = assignmentRows;
+
       return this.sendResponse(req, res, {
         status: 200,
-        data: users.map((u) => ({
-          ...u,
-          productIds: u.purchaserProducts?.map((p) => p.productId) || [],
-          assignedSiteCount:
-            [Role.SUPER_ADMIN, Role.ADMIN, Role.DIRECTOR, Role.QA, Role.ACCOUNT].includes(u.role)
-              ? totalSites
-              : Number(u?._count?.updatedSites || 0) +
-                Number(u?._count?.siteSupervisors || 0) +
-                Number(u?._count?.sitePurchasers || 0) +
-                Number(u?._count?.siteSeniorEngineers || 0),
-        })),
+        message: "Users fetched successfully",
+        data: {
+          items: mapped,
+          pagination: {
+            page: safePage,
+            limit,
+            total,
+            totalPages,
+            from: total === 0 ? 0 : skip + 1,
+            to: Math.min(skip + mapped.length, total),
+          },
+          statusCounts,
+          stats: {
+            total: unfilteredTotal,
+            active: activeAll,
+            rolesConfigured: unfilteredRoleGroups.length,
+            siteAssignments: Number(supCount || 0) + Number(purchCount || 0) + Number(seCount || 0),
+          },
+        },
       });
     } catch (error) {
       console.error(error);

@@ -40,8 +40,8 @@ const wrapJsonOnce = (res, wrapper) => {
 const redisCache = async (req, res, next) => {
   const method = String(req.method || "").toUpperCase();
 
-  // --- POST / PUT / PATCH / DELETE: invalidate GET cache after success ---
-  if (isMutatingMethod(method)) {
+  // --- Real mutations: invalidate GET/read-cache after success ---
+  if (isMutatingMethod(method, req)) {
     wrapJsonOnce(res, (body, originalJson) => {
       const code = res.statusCode || 200;
       if (code >= 200 && code < 300) {
@@ -55,7 +55,7 @@ const redisCache = async (req, res, next) => {
     return next();
   }
 
-  // --- GET: cache JSON responses (skip binary endpoints) ---
+  // --- GET + read-like POST (by-stage / bulk): cache JSON responses ---
   if (shouldSkipGetCache(req)) {
     return next();
   }
