@@ -12,9 +12,10 @@ const toFloat = (v) => {
 };
 
 const normalizeStatus = (status) => {
-  if (!status) return RequestStatus.PENDING;
-  const value = String(status).toUpperCase();
-  return RequestStatus[value] || RequestStatus.PENDING;
+  if (!status) return RequestStatus.IN_PROGRESS;
+  const value = String(status).toUpperCase().replace(/[\s-]+/g, "_");
+  if (value === "PENDING") return RequestStatus.IN_PROGRESS;
+  return RequestStatus[value] || RequestStatus.IN_PROGRESS;
 };
 
 const normalizeStageName = (stageName) => {
@@ -140,7 +141,7 @@ const deriveRequestStatus = (request, stages = []) => {
   if (hasApprovedStage || releasedQty > 0 || receivedQty > 0) {
     return RequestStatus.IN_PROGRESS;
   }
-  return RequestStatus.PENDING;
+  return RequestStatus.IN_PROGRESS;
 };
 
 const serializeRequest = (request) => {
@@ -155,7 +156,10 @@ const serializeRequest = (request) => {
   const remainingMaterial = Number(Math.max(totalMaterial - usedMaterial, 0).toFixed(6));
   return {
     ...request,
-    status: String(request?.status || RequestStatus.PENDING).toLowerCase(),
+    status: (() => {
+      const raw = String(request?.status || RequestStatus.IN_PROGRESS).toLowerCase();
+      return raw === "pending" ? "in_progress" : raw;
+    })(),
     total_material: totalMaterial,
     used_material: usedMaterial,
     remaining_material: remainingMaterial,
@@ -171,6 +175,49 @@ const serializeRequest = (request) => {
     stageWiseQty,
     stage_wise_qty: stageWiseQty,
     stages,
+  };
+};
+
+const wantsTruthyQuery = (value) =>
+  ["1", "true", "yes"].includes(String(value || "").trim().toLowerCase());
+
+/** Main dashboard latest-requests table — no stages/users/images. */
+const requestDashboardSelect = {
+  id: true,
+  siteRequestId: true,
+  siteId: true,
+  qty: true,
+  status: true,
+  stageName: true,
+  stageWiseQty: true,
+  createdAt: true,
+  updatedAt: true,
+  site: { select: { id: true, name: true } },
+  product: { select: { id: true, name: true, unit: true } },
+};
+
+const serializeDashboardRequest = (request) => {
+  const raw = String(request?.status || RequestStatus.IN_PROGRESS).toLowerCase();
+  return {
+    id: request?.id,
+    siteRequestId: request?.siteRequestId,
+    siteId: request?.siteId,
+    qty: request?.qty,
+    status: raw === "pending" ? "in_progress" : raw,
+    stageName: request?.stageName || null,
+    stageWiseQty: request?.stageWiseQty || null,
+    createdAt: request?.createdAt,
+    updatedAt: request?.updatedAt,
+    site: request?.site
+      ? { id: request.site.id, name: request.site.name }
+      : null,
+    product: request?.product
+      ? {
+          id: request.product.id,
+          name: request.product.name,
+          unit: request.product.unit,
+        }
+      : null,
   };
 };
 
@@ -734,12 +781,50 @@ class Requests extends Response {
   };
 
   getRequests = async (req, res) => {
+    const { timedDbForReq, attachRequestTiming } = require("../lib/perf");
+    attachRequestTiming(req, res, "GET /request");
     try {
-      const requests = await prisma.request.findMany({
-        include: { site: true, stages: { include: { user: { select: { id: true, name: true, role: true } } } }, product: true },
-        orderBy: { createdAt: "desc" },
+      const dashboardOnly = wantsTruthyQuery(
+        req.query.dashboard || req.query.lite,
+      );
+      const limitParam = parseInt(req.query.limit, 10);
+      const take = Number.isFinite(limitParam)
+        ? Math.min(100, Math.max(1, limitParam))
+        : dashboardOnly
+          ? 10
+          : undefined;
+
+      const requests = await timedDbForReq(
+        req,
+        dashboardOnly ? "request.findMany(dashboard)" : "request.findMany",
+        () =>
+          dashboardOnly
+            ? prisma.request.findMany({
+                select: requestDashboardSelect,
+                orderBy: { createdAt: "desc" },
+                ...(take != null ? { take } : {}),
+              })
+            : prisma.request.findMany({
+                include: {
+                  site: { select: { id: true, name: true, status: true } },
+                  product: { select: { id: true, name: true, unit: true } },
+                  stages: {
+                    include: {
+                      user: { select: { id: true, name: true, role: true } },
+                    },
+                  },
+                },
+                orderBy: { createdAt: "desc" },
+                ...(take != null ? { take } : {}),
+              }),
+      );
+
+      return this.sendResponse(req, res, {
+        status: 200,
+        data: dashboardOnly
+          ? requests.map(serializeDashboardRequest)
+          : requests.map(serializeRequest),
       });
-      return this.sendResponse(req, res, { status: 200, data: requests.map(serializeRequest) });
     } catch (error) {
       return this.sendResponse(req, res, {
         status: 500,
@@ -1016,6 +1101,12 @@ class Requests extends Response {
       // Await usage recalc so remaining material is current before clients refresh.
       try {
         await recalculateSiteStageUsage(updatedRequest.siteId);
+        try {
+          const { safeDel } = require("../lib/redis");
+          await safeDel(`stageheal:${updatedRequest.siteId}`);
+        } catch {
+          /* ignore */
+        }
       } catch (recalcError) {
         console.error(
           `[Request.updateRequest] recalculateSiteStageUsage failed for site ${updatedRequest.siteId}:`,
@@ -1064,10 +1155,60 @@ class Requests extends Response {
     try {
       const siteId = Number(req.params.siteId);
       if (!(await this.ensureSiteAccess(req, res, siteId))) return;
+
+      const summary =
+        String(req.query.summary || "")
+          .trim()
+          .toLowerCase() === "1" ||
+        String(req.query.summary || "")
+          .trim()
+          .toLowerCase() === "true";
+      const limitRaw = Number(req.query.limit);
+      const take =
+        Number.isFinite(limitRaw) && limitRaw > 0
+          ? Math.min(Math.floor(limitRaw), 200)
+          : undefined;
+
+      // Site overview dashboard only needs product + qty + status fields.
+      if (summary) {
+        const requests = await prisma.request.findMany({
+          where: { siteId },
+          select: {
+            id: true,
+            siteRequestId: true,
+            siteId: true,
+            productId: true,
+            qty: true,
+            status: true,
+            priority: true,
+            stageName: true,
+            stageWiseQty: true,
+            createdAt: true,
+            updatedAt: true,
+            product: { select: { id: true, name: true, unit: true } },
+          },
+          orderBy: { createdAt: "desc" },
+          ...(take ? { take } : {}),
+        });
+        return this.sendResponse(req, res, {
+          status: 200,
+          data: requests.map((request) => {
+            const raw = String(
+              request?.status || RequestStatus.IN_PROGRESS,
+            ).toLowerCase();
+            return {
+              ...request,
+              status: raw === "pending" ? "in_progress" : raw,
+            };
+          }),
+        });
+      }
+
       const requests = await prisma.request.findMany({
         where: { siteId },
         include: { site: true, stages: { include: { user: { select: { id: true, name: true, role: true } } } }, product: true },
         orderBy: { createdAt: "desc" },
+        ...(take ? { take } : {}),
       });
       return this.sendResponse(req, res, { status: 200, data: requests.map(serializeRequest) });
     } catch (error) {
@@ -1080,6 +1221,8 @@ class Requests extends Response {
   };
 
   getRequestsByStageNameFromBody = async (req, res) => {
+    const { timedDbForReq, attachRequestTiming } = require("../lib/perf");
+    attachRequestTiming(req, res, "POST /request/by-stage");
     try {
       const body = req.body || {};
       const stageName = normalizeStageName(body.stageName);
@@ -1145,23 +1288,33 @@ class Requests extends Response {
         ];
       }
 
+      // List rows: slim site/product; stages without nested user blobs (current-step UI).
       const listInclude = {
         site: { select: { id: true, name: true, status: true } },
         product: { select: { id: true, name: true, unit: true } },
         stages: {
-          include: {
-            user: { select: { id: true, name: true, role: true } },
+          select: {
+            id: true,
+            stageName: true,
+            status: true,
+            userId: true,
           },
         },
       };
 
       // Backward compatible: callers without page/limit still get a full array.
       if (!usePagination) {
-        const requests = await prisma.request.findMany({
-          where: statusFilter ? { ...where, status: statusFilter } : where,
-          include: listInclude,
-          orderBy: { createdAt: "desc" },
-        });
+        const requests = await timedDbForReq(
+          req,
+          "request.findMany(by-stage)",
+          () =>
+            prisma.request.findMany({
+              where: statusFilter ? { ...where, status: statusFilter } : where,
+              include: listInclude,
+              orderBy: { createdAt: "desc" },
+            }),
+          { siteId },
+        );
         return this.sendResponse(req, res, {
           status: 200,
           data: requests.map(serializeRequest),
@@ -1177,26 +1330,60 @@ class Requests extends Response {
       // Tab counts ignore status filter so each status pill total stays correct.
       const tabCountWhere = { ...where };
 
-      const [total, statusGroups] = await Promise.all([
-        prisma.request.count({ where: listWhere }),
-        prisma.request.groupBy({
-          by: ["status"],
-          where: tabCountWhere,
-          _count: { _all: true },
-        }),
+      const [total, statusGroups, pageRows] = await Promise.all([
+        timedDbForReq(
+          req,
+          "request.count(by-stage)",
+          () => prisma.request.count({ where: listWhere }),
+          { siteId },
+        ),
+        timedDbForReq(
+          req,
+          "request.groupBy(by-stage)",
+          () =>
+            prisma.request.groupBy({
+              by: ["status"],
+              where: tabCountWhere,
+              _count: { _all: true },
+            }),
+          { siteId },
+        ),
+        // Prefetch first page in parallel with counts (re-fetch if page clamped).
+        timedDbForReq(
+          req,
+          "request.findMany(by-stage page)",
+          () =>
+            prisma.request.findMany({
+              where: listWhere,
+              include: listInclude,
+              orderBy: { createdAt: "desc" },
+              skip: (Math.max(1, page) - 1) * limit,
+              take: limit,
+            }),
+          { siteId },
+        ),
       ]);
 
       const totalPages = Math.max(1, Math.ceil(total / limit) || 1);
       const safePage = Math.min(page, totalPages);
       const skip = (safePage - 1) * limit;
 
-      const pageRows = await prisma.request.findMany({
-        where: listWhere,
-        include: listInclude,
-        orderBy: { createdAt: "desc" },
-        skip,
-        take: limit,
-      });
+      let rows = pageRows;
+      if (safePage !== page) {
+        rows = await timedDbForReq(
+          req,
+          "request.findMany(by-stage page-clamp)",
+          () =>
+            prisma.request.findMany({
+              where: listWhere,
+              include: listInclude,
+              orderBy: { createdAt: "desc" },
+              skip,
+              take: limit,
+            }),
+          { siteId },
+        );
+      }
 
       const statusCounts = {
         all: 0,
@@ -1222,14 +1409,14 @@ class Requests extends Response {
         status: 200,
         message: "Requests fetched successfully",
         data: {
-          items: pageRows.map(serializeRequest),
+          items: rows.map(serializeRequest),
           pagination: {
             page: safePage,
             limit,
             total,
             totalPages,
             from: total === 0 ? 0 : skip + 1,
-            to: Math.min(skip + pageRows.length, total),
+            to: Math.min(skip + rows.length, total),
           },
           statusCounts,
         },

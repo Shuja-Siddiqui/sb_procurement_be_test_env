@@ -1,10 +1,8 @@
 const { Role } = require("@prisma/client");
 const Response = require("./Response");
 const webpush = require("web-push");
-// Socket.IO disabled — notification realtime via Supabase postgres_changes on "Notification".
-// const { emitToUsers } = require("../socket");
-
 const prisma = require("../lib/prisma");
+const { emitNotificationsCreated } = require("../lib/socket");
 
 class PushNotificationService {
   constructor() {
@@ -26,8 +24,23 @@ class PushNotificationService {
 
   getFrontendAppUrl = () =>
     String(
-      process.env.FRONTEND_APP_URL || "https://sb-procurement-fe-test-env.vercel.app"
+      process.env.FRONTEND_APP_URL || "https://sta.syedbrothers.app"
     ).replace(/\/+$/, "");
+
+  /** Display label for roles/stages in notification copy (API role stays `qa`). */
+  formatNotificationRoleLabel = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return "User";
+    const normalized = raw.toLowerCase().replace(/_/g, " ").trim();
+    if (
+      normalized === "qa" ||
+      normalized === "quality assurance" ||
+      normalized === "quality assurance officer"
+    ) {
+      return "QS";
+    }
+    return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
+  };
 
   sendPushToUsers = async (userIds = [], payload = {}) => {
     const targetUserIds = [...new Set((userIds || []).map((id) => Number(id)))]
@@ -231,29 +244,21 @@ class PushNotificationService {
     releasedQty,
     receivedQty,
   }) => {
-    const actorRole = String(role || "User")
-      .replace(/_/g, " ")
-      .toLowerCase();
-    const actorRoleLabel = actorRole
-      .replace(/\b\w/g, (char) => char.toUpperCase())
-      .trim();
+    const actorRoleLabel = this.formatNotificationRoleLabel(role || "User");
     const actorIdentity = `${actorRoleLabel} (${actorName || "User"})`;
     const requestLabel = requestId ? `MR-${requestId}` : "material request";
     const target = materialName ? `"${materialName}"` : "material";
     const siteText = siteName ? ` at ${siteName}` : "";
     const releasedQtyText = Number(releasedQty) > 0 ? ` (${Number(releasedQty)})` : "";
     const receivedQtyText = Number(receivedQty) > 0 ? ` (${Number(receivedQty)})` : "";
-    const approvalRoleLabel =
-      String(
-        approvalRole ||
-          (action === "qa_approved"
-            ? "QA"
-            : action === "account_approved"
+    const approvalRoleLabel = this.formatNotificationRoleLabel(
+      approvalRole ||
+        (action === "qa_approved"
+          ? "QS"
+          : action === "account_approved"
             ? "Account"
-            : "Approval")
-      )
-        .replace(/_/g, " ")
-        .trim();
+            : "Approval"),
+    );
 
     const titleMap = {
       created: siteName || "Material Request",
@@ -297,10 +302,7 @@ class PushNotificationService {
     productId,
     qty,
   }) => {
-    const roleLabel = String(actorRole || "user")
-      .replace(/_/g, " ")
-      .toLowerCase()
-      .replace(/\b\w/g, (char) => char.toUpperCase());
+    const roleLabel = this.formatNotificationRoleLabel(actorRole || "user");
     const actorLabel = `${actorName || "User"} (${roleLabel})`;
     const siteText = siteName || "site";
     const normalizedAction = String(action || "updated").toLowerCase();
@@ -407,6 +409,8 @@ class PushNotificationService {
       await prisma.notification.createMany({
         data: filteredRows.map(({ _dedupeKey, ...row }) => row),
       });
+      // Explicit Socket.IO emit so Navbar updates even if Prisma middleware misses createMany
+      emitNotificationsCreated(dbSavedUserIds, { event, type, title });
     }
 
     console.log("[Notification][DB]", {
@@ -424,42 +428,13 @@ class PushNotificationService {
       data,
     });
 
-    // const realtimePayload = {
-    //   title,
-    //   body,
-    //   type,
-    //   data,
-    //   senderId,
-    //   recipientIds: uniqueRecipientIds,
-    //   createdAt: new Date().toISOString(),
-    // };
-
-    // Room-targeted emit (preferred) — disabled; clients use Supabase Realtime on Notification rows.
-    // emitToUsers(uniqueRecipientIds, "notification:new", realtimePayload);
-
-    // Broadcast fallback so clients still receive even if a user room join was missed.
-    // try {
-    //   const { emitBroadcast } = require("../socket");
-    //   emitBroadcast("notification:new", realtimePayload);
-    // } catch (error) {
-    //   console.error(
-    //     "[Notification][Socket] broadcast fallback failed:",
-    //     error?.message || error
-    //   );
-    // }
-
-    // console.log("[Notification][Socket] emitted notification:new", {
-    //   event,
-    //   type,
-    //   recipientIds: uniqueRecipientIds,
-    //   senderId,
-    // });
-    console.log("[Notification][Realtime] DB rows saved; clients subscribe via Supabase", {
+    console.log("[Notification][Realtime] DB rows saved; clients subscribe via Socket.IO", {
       event,
       type,
       recipientIds: uniqueRecipientIds,
       senderId,
       savedCount: filteredRows.length,
+      socketEmitted: filteredRows.length > 0,
     });
 
     console.log("[Notification][Dispatch] final", {
@@ -576,6 +551,7 @@ class PushNotificationService {
         senderId,
         recipientIds: recipients.map((m) => m.userId),
       });
+      const chatRecipientIds = recipients.map((m) => m.userId);
       await prisma.notification.createMany({
         data: recipients.map((m) => ({
           userId: m.userId,
@@ -585,8 +561,12 @@ class PushNotificationService {
           data: { groupId: group.id },
         })),
       });
+      emitNotificationsCreated(chatRecipientIds, {
+        event: "CHAT_MESSAGE",
+        type: message?.type || "TEXT",
+      });
       const pushSummary = await this.sendPushToUsers(
-        recipients.map((m) => m.userId),
+        chatRecipientIds,
         {
           title: `${message?.sender?.name || "User"} - ${group.name}`,
           body: message?.content || "",
@@ -615,7 +595,26 @@ class PushNotificationService {
       const siteId = Number(site?.id);
 
       const action = String(req.body.action || req.body.payload?.action || "updated").toLowerCase();
-      const recipientIds = await this.getSiteRelatedRecipientIds(siteId, senderId);
+      const isDeleteAction = action === "delete" || action === "deleted";
+
+      // After a site is deleted, related assignees are gone — always notify Admin/Super Admin.
+      let recipientIds = isDeleteAction
+        ? []
+        : await this.getSiteRelatedRecipientIds(siteId, senderId);
+
+      if (isDeleteAction || recipientIds.length === 0) {
+        const admins = await prisma.user.findMany({
+          where: { role: { in: [Role.ADMIN, Role.SUPER_ADMIN] } },
+          select: { id: true },
+        });
+        recipientIds = [
+          ...new Set([
+            ...recipientIds,
+            ...admins.map((u) => u.id).filter((id) => id !== senderId),
+          ]),
+        ];
+      }
+
       const message = this.buildSiteActivityMessage({
         action,
         actorRole: sender.role,
@@ -835,7 +834,7 @@ class PushNotificationService {
           payload?.stageName ||
           payload?.currentStage ||
           (action === "qa_approved"
-            ? "QA"
+            ? "QS"
             : action === "account_approved"
             ? "Account"
             : "Approval"),

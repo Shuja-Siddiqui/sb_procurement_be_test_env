@@ -1,10 +1,8 @@
 const { TaskStatus, Role } = require("@prisma/client");
 const prisma = require("../lib/prisma");
+const { basePrisma } = prisma;
 const Response = require("./Response");
 const PushNotificationService = require("./PushNotificationService");
-// Socket.IO broadcast disabled — Task realtime via Supabase postgres_changes on "Task".
-// const { emitBroadcast } = require("../socket");
-
 const pushNotificationService = new PushNotificationService();
 
 const STATUS_TO_API = {
@@ -292,7 +290,9 @@ class Task extends Response {
   markOverdueAsDelay = async () => {
     // Only auto-move untouched backlog (TODO). Never revert IN_PROGRESS —
     // that caused Delay → In Progress to snap back to Delay on the next list fetch.
-    await prisma.task.updateMany({
+    // Use basePrisma so this heal does not emit Socket.IO db:change — otherwise
+    // the Task page aborts its own in-flight GET and can stick on the skeleton.
+    await basePrisma.task.updateMany({
       where: {
         due_date: { lt: startOfToday() },
         status: TaskStatus.TODO,
@@ -410,18 +410,6 @@ class Task extends Response {
           notifyError?.message || notifyError
         );
       }
-
-      // try {
-      //   emitBroadcast("task:updated", {
-      //     action: "created",
-      //     task: serialized,
-      //   });
-      // } catch (socketError) {
-      //   console.error(
-      //     "[Task][Socket] failed to broadcast create:",
-      //     socketError?.message || socketError
-      //   );
-      // }
 
       return this.sendResponse(req, res, {
         status: 201,
@@ -649,18 +637,6 @@ class Task extends Response {
         });
       }
 
-      // try {
-      //   emitBroadcast("task:updated", {
-      //     action: "updated",
-      //     task: serialized,
-      //   });
-      // } catch (socketError) {
-      //   console.error(
-      //     "[Task][Socket] failed to broadcast update:",
-      //     socketError?.message || socketError
-      //   );
-      // }
-
       return this.sendResponse(req, res, {
         status: 200,
         message: "Task updated",
@@ -792,19 +768,6 @@ class Task extends Response {
         }
       }
 
-      // try {
-      //   emitBroadcast("task:updated", {
-      //     action: "status_updated",
-      //     task: serialized,
-      //     previousStatus: STATUS_TO_API[previousStatus] || previousStatus,
-      //   });
-      // } catch (socketError) {
-      //   console.error(
-      //     "[Task][Socket] failed to broadcast status update:",
-      //     socketError?.message || socketError
-      //   );
-      // }
-
       return this.sendResponse(req, res, {
         status: 200,
         message: "Task status updated",
@@ -859,18 +822,6 @@ class Task extends Response {
       });
 
       await prisma.task.delete({ where: { id } });
-
-      // try {
-      //   emitBroadcast("task:updated", {
-      //     action: "deleted",
-      //     taskId: id,
-      //   });
-      // } catch (socketError) {
-      //   console.error(
-      //     "[Task][Socket] failed to broadcast delete:",
-      //     socketError?.message || socketError
-      //   );
-      // }
 
       return this.sendResponse(req, res, {
         status: 200,

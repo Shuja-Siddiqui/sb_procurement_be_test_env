@@ -1,6 +1,9 @@
 const jwt = require("jsonwebtoken");
 const prisma = require("../lib/prisma");
 const redisCache = require("./redisCache");
+const { safeGet, safeSet } = require("../lib/redis");
+
+const AUTH_USER_TTL_SECONDS = Number(process.env.AUTH_USER_CACHE_TTL_SECONDS) || 60;
 
 const authenticateJWTCore = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -27,16 +30,23 @@ const authenticateJWTCore = async (req, res, next) => {
       return res.status(401).json({ message: "Invalid or expired token" });
     }
 
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true,
-        name: true,
-        role: true,
-        status: true,
-        isEdit: true,
-      },
-    });
+    const cacheKey = `auth:user:${userId}`;
+    let user = await safeGet(cacheKey);
+    if (!user || typeof user !== "object" || !user.id) {
+      user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          name: true,
+          role: true,
+          status: true,
+          isEdit: true,
+        },
+      });
+      if (user) {
+        await safeSet(cacheKey, user, AUTH_USER_TTL_SECONDS);
+      }
+    }
 
     if (!user) {
       return res.status(401).json({ message: "User not found or inactive" });
